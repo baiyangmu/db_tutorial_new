@@ -1,0 +1,5 @@
+---
+triple:          'arm64-apple-darwin'
+binary-path:     '/Users/baiyangmu333/Projects/db_learn/db_tutorial-master/demo/show_serialize_demo'
+relocations:     []
+...
