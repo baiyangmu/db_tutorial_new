@@ -73,6 +73,7 @@ typedef struct {
 
 /* define MAX_VALUES after schema constants */
 #define MAX_VALUES MAX_COLUMNS
+#define MAX_SELECT_COLS MAX_COLUMNS
 
 typedef struct {
   StatementType type;
@@ -83,7 +84,261 @@ typedef struct {
 
   //兼容旧实现（可保留不用）
   Row row_to_insert;  // only used by insert statement
+
+  uint32_t proj_count; //0 表示*
+  int proj_indices[MAX_SELECT_COLS];
+
+  bool has_where;
+  int where_col_index;
+  bool where_is_string;
+  int where_int;
+  char where_str[256]; // 拷贝一份用于比较
+
 } Statement;
+
+// helper 
+static int schema_col_index(const TableSchema* s,const char* name){
+  for (uint32_t i = 0 ; i < s->num_columns ; i++){
+    if(strncmp(s->columns[i].name , name , MAX_COLUMN_NAME_LEN) == 0){
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+
+static uint32_t schema_col_offset(const TableSchema* s, int col_idx){
+  uint32_t off = 0;
+  for(int i = 0 ; i < col_idx ; i++){
+    off += (s->columns[i].type == COL_TYPE_INT) ? 4 : s->columns[i].size;
+  }
+  return off;
+}
+
+
+static int row_get_int(Table* t,const void* row,int col_idx){
+  uint32_t off = schema_col_offset(&t->active_schema,col_idx);
+  int v;
+  memcpy(&v,(const uint8_t*)row + off,4);
+  return v;
+}
+
+
+static void row_get_string(Table* t,const void* row, int col_idx, char* out,size_t cap){
+  uint32_t off = schema_col_offset(&t->active_schema,col_idx);
+  size_t sz = t->active_schema.columns[col_idx].size;
+  size_t n = (sz < cap - 1) ? sz : (cap - 1);
+  memcpy(out, (const uint8_t*)row + off, n);
+  out[n] = 0;
+  while (n > 0 && out[n-1] == 0){
+    n--;
+  }
+  out[n] = 0;
+}
+
+
+static bool row_matches_where(Table* t,const void* row, const Statement* st){
+  if(!st->has_where) return true;
+  if(st->where_is_string){
+    char buf[512];
+    row_get_string(t,row,st->where_col_index,buf,sizeof(buf));
+    return strcmp(buf,st->where_str) == 0;
+  } else {
+    int v = row_get_int(t,row,st->where_col_index);
+    return v == st->where_int;
+  }
+}
+
+
+static void print_row_projected(Table* t, const void* row, const int* idxs, uint32_t n){
+  if(n == 0){
+    print_row_dynamic(t,row);
+    return;
+  }
+  printf("(");
+  for(uint32_t i = 0 ; i < n ; i++){
+    if(i){
+      printf(",");
+    }
+    const ColumnDef* c = &t->active_schema.columns[idex[i]];
+    if(c->type == COL_TYPE_INT){
+      int v = row_get_int(t,row,idxs[i]);
+      printf("%d",v);
+    }else{
+      char s[512];
+      row_get_string(t,row,idxs[i],s,sizeof[s]);
+      printf("%s",s);
+    }
+  }
+  printf(")\n");
+}
+
+
+PrepareResult prepare_select(InputBuffer* in, Statement* st, Table* table) {
+  // Initialize statement
+  st->type = STATEMENT_SELECT;
+  st->target_table[0] = '\0';
+  st->proj_count = 0;
+  st->has_where = false;
+
+  // Trim leading spaces
+  char* s = in->buffer;
+  while (*s == ' ' || *s == '\t') {
+    s++;
+  }
+
+  // Skip keyword "select"
+  s += 6;
+  while (*s == ' ' || *s == '\t') {
+    s++;
+  }
+
+  // Parse projection: "*" or "col1,col2,..."
+  if (*s == '*') {
+    // "*" means proj_count = 0 (print all columns)
+    s++;
+  } else {
+    // Determine the slice of projection list before " from " or " where " or end
+    char* proj_start = s;
+    char* from_kw = strstr(proj_start, " from ");
+    char* where_kw = strstr(proj_start, " where ");
+
+    char* proj_end = NULL;
+    if (from_kw != NULL) {
+      proj_end = from_kw;
+    } else if (where_kw != NULL) {
+      proj_end = where_kw;
+    } else {
+      proj_end = proj_start + strlen(proj_start);
+    }
+
+    size_t proj_len = (size_t)(proj_end - proj_start);
+    char proj_buf[512];
+    if (proj_len >= sizeof(proj_buf)) {
+      proj_len = sizeof(proj_buf) - 1;
+    }
+    strncpy(proj_buf, proj_start, proj_len);
+    proj_buf[proj_len] = '\0';
+
+    // Split by commas
+    char* tok = strtok(proj_buf, ",");
+    while (tok != NULL) {
+      while (*tok == ' ' || *tok == '\t') {
+        tok++;
+      }
+
+      int col_index = schema_col_index(&table->active_schema, tok);
+      if (col_index < 0) {
+        printf("Unknown column: %s\n", tok);
+        return PREPARE_SYNTAX_ERROR;
+      }
+
+      st->proj_indices[st->proj_count++] = col_index;
+      tok = strtok(NULL, ",");
+    }
+
+    // Advance s past the projection slice
+    s = proj_end;
+  }
+
+  // Optional: FROM <table>
+  while (*s == ' ' || *s == '\t') {
+    s++;
+  }
+  if (strncmp(s, "from ", 5) == 0) {
+    s += 5;
+    while (*s == ' ' || *s == '\t') {
+      s++;
+    }
+
+    char* name_end = s;
+    while (*name_end && *name_end != ' ' && *name_end != '\t') {
+      name_end++;
+    }
+
+    size_t name_len = (size_t)(name_end - s);
+    if (name_len >= MAX_TABLE_NAME_LEN) {
+      name_len = MAX_TABLE_NAME_LEN - 1;
+    }
+    strncpy(st->target_table, s, name_len);
+    st->target_table[name_len] = '\0';
+
+    s = name_end;
+  }
+
+  // Optional: WHERE <col> = <val>
+  while (*s == ' ' || *s == '\t') {
+    s++;
+  }
+  if (strncmp(s, "where ", 6) == 0) {
+    s += 6;
+    while (*s == ' ' || *s == '\t') {
+      s++;
+    }
+
+    // Parse column name up to '='
+    char col_name[64];
+    int ci = 0;
+    while (*s && *s != ' ' && *s != '\t' && *s != '=') {
+      if (ci < (int)sizeof(col_name) - 1) {
+        col_name[ci++] = *s;
+      }
+      s++;
+    }
+    col_name[ci] = '\0';
+
+    while (*s == ' ' || *s == '\t') {
+      s++;
+    }
+    if (*s != '=') {
+      return PREPARE_SYNTAX_ERROR;
+    }
+    s++;
+    while (*s == ' ' || *s == '\t') {
+      s++;
+    }
+
+    // Parse value token (no spaces or quotes supported)
+    char val[256];
+    int vi = 0;
+    while (*s && *s != ' ' && *s != '\t') {
+      if (vi < (int)sizeof(val) - 1) {
+        val[vi++] = *s;
+      }
+      s++;
+    }
+    val[vi] = '\0';
+
+    // Map column and store predicate
+    int idx = schema_col_index(&table->active_schema, col_name);
+    if (idx < 0) {
+      printf("Unknown column: %s\n", col_name);
+      return PREPARE_SYNTAX_ERROR;
+    }
+
+    st->has_where = true;
+    st->where_col_index = idx;
+
+    if (table->active_schema.columns[idx].type == COL_TYPE_INT) {
+      int v = 0;
+      if (parse_int(val, &v) != 0) {
+        printf("Invalid int: %s\n", val);
+        return PREPARE_SYNTAX_ERROR;
+      }
+      st->where_is_string = false;
+      st->where_int = v;
+    } else {
+      st->where_is_string = true;
+      strncpy(st->where_str, val, sizeof(st->where_str) - 1);
+      st->where_str[sizeof(st->where_str) - 1] = '\0';
+    }
+  }
+
+  return PREPARE_SUCCESS;
+}
+
+
+
 
 #define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
 
@@ -1003,9 +1258,8 @@ PrepareResult prepare_statement(InputBuffer* input_buffer,
       return PREPARE_UNRECOGNIZED_STATEMENT;
     }
   }
-  if (strcmp(s, "select") == 0) {
-    statement->type = STATEMENT_SELECT;
-    return PREPARE_SUCCESS;
+  if (strncmp(s, "select") == 0) {
+    return prepare_select(input_buffer, statement, table);
   }
 
   return PREPARE_UNRECOGNIZED_STATEMENT;
@@ -1421,23 +1675,64 @@ ExecuteResult execute_insert(Statement* st, Table* table) {
 }
 
 
-ExecuteResult execute_select(Statement* statement, Table* table) {
+ExecuteResult execute_select(Statement* st, Table* table) {
+
+  if(st->target_table[0]){
+    int idx = catalog_find(table->pager,st->target_table);
+    if(idx < 0){
+      printf("Table not found: %s\n", st->target_table);
+      return EXECUTE_SUCCESS;
+    }
+    CatalogEntry* ents = catalog_entries(table->pager);
+    table->root_page_num = ents[idx].root_page_num;
+    table->active_schema = ents[idx].schema;
+    table->row_size = compute_row_size(&table->active_schema);
+
+  }
+
   if(table->root_page_num == INVALID_PAGE_NUM){
     printf("No active table. Use 'use <table>' or 'create table..' first.\n");
     return EXECUTE_SUCCESS;
   }
 
-  Cursor* cursor = table_start(table);
+   // where 命中主键（第0列为 int）时走 B-Tree 精确定位
+  bool can_point_lookup = 
+       st->has_where &&
+       (st->where_col_index == 0) &&
+       !st->where_is_string &&
+       (table->active_schema.columns[0].type == COL_TYPE_INT);
 
-  Row row;
-  while (!(cursor->end_of_table)) {
-    void* val = leaf_value_t(table, get_page(table->pager, cursor->page_num), cursor->cell_num);
-    print_row_dynamic(table, val);
-    cursor_advance(cursor);
+  
+  if (can_point_lookup){
+    uint32_t key = (uint32_t)st->where_int;
+    Cursor* cursor = table_find(table,key);
+    void* node = get_page(table->pager,cursor->page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+
+    if(cursor->cell_num < num_cells){
+      uint32_t key_at_index = *leaf_key_t(table,node,cursor->cell_num);
+      if(key_at_index == key){
+        void* row = leaf_value_t(table,node,cursor->cell_num);
+        if(row_matches_where(table,row,st)){
+          print_row_projected(table,row,st->proj_indices,st->proj_count);
+        }
+      }
+    }
+    free(cursor);
+    return EXECUTE_SUCCESS;
+
   }
 
+  // 否则全表扫描
+  Cursor* cursor = table_start(table);
+  while (!(cursor->end_of_table)) {
+    void* row = cursor_value(cursor);
+    if (row_matches_where(table,row,st)){
+      print_row_projected(table,row,st->proj_indices,st->proj_count);
+    }
+    cursor_advance(cursor);
+  }
   free(cursor);
-
   return EXECUTE_SUCCESS;
 }
 
