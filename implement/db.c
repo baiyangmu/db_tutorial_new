@@ -71,6 +71,25 @@ typedef struct {
   ColumnDef columns[MAX_COLUMNS];
 } TableSchema;
 
+
+#define TABLE_MAX_PAGES 400
+
+typedef struct {
+  int file_descriptor;
+  uint32_t file_length;
+  uint32_t num_pages;
+  void* pages[TABLE_MAX_PAGES];
+} Pager;
+
+
+typedef struct {
+  Pager* pager;
+  uint32_t root_page_num;
+
+  TableSchema active_schema;
+  uint32_t row_size;
+} Table;
+
 /* define MAX_VALUES after schema constants */
 #define MAX_VALUES MAX_COLUMNS
 #define MAX_SELECT_COLS MAX_COLUMNS
@@ -95,6 +114,9 @@ typedef struct {
   char where_str[256]; // 拷贝一份用于比较
 
 } Statement;
+
+// Forward decls needed by prepare_select
+int lookup_table_schema(Pager* pager, const char* name, TableSchema* out_schema);
 
 // helper 
 static int schema_col_index(const TableSchema* s,const char* name){
@@ -150,6 +172,39 @@ static bool row_matches_where(Table* t,const void* row, const Statement* st){
 }
 
 
+static void print_row_dynamic(Table* t,const void* src){
+  const uint8_t* p = (const uint8_t*)src;
+  printf("(");
+  for(uint32_t i = 0 ; i < t->active_schema.num_columns ; i++){
+    const ColumnDef* c = &t->active_schema.columns[i];
+    if(i){
+      printf(", ");
+    }
+
+    if(c->type == COL_TYPE_INT){
+      int v;
+      memcpy(&v,p,4);
+      p+=4;
+      printf("%d",v);
+    } else {
+      char buf[512];
+      size_t m = c->size < sizeof(buf)-1? c->size : sizeof(buf)-1;
+      memcpy(buf,p,m);
+      buf[m]=0;
+      size_t r = m;
+      while (r > 0 && buf[r - 1] == 0) {
+        r--;
+      }
+      buf[r] = 0;
+      printf("%s",buf);
+      p += c->size;
+    }
+  }
+  printf(")\n");
+}
+
+
+
 static void print_row_projected(Table* t, const void* row, const int* idxs, uint32_t n){
   if(n == 0){
     print_row_dynamic(t,row);
@@ -160,18 +215,34 @@ static void print_row_projected(Table* t, const void* row, const int* idxs, uint
     if(i){
       printf(",");
     }
-    const ColumnDef* c = &t->active_schema.columns[idex[i]];
+    const ColumnDef* c = &t->active_schema.columns[idxs[i]];
     if(c->type == COL_TYPE_INT){
       int v = row_get_int(t,row,idxs[i]);
       printf("%d",v);
     }else{
       char s[512];
-      row_get_string(t,row,idxs[i],s,sizeof[s]);
+      row_get_string(t,row,idxs[i],s,sizeof(s));
       printf("%s",s);
     }
   }
   printf(")\n");
 }
+
+
+
+static int parse_int(const char* s,int* out){
+  char* end = NULL;
+  long v = strtol(s,&end,10);
+  if(end == s || *end != '\0'){
+    return -1;
+  }
+  if(v < INT32_MIN || v > INT32_MAX){
+    return -1;
+  }
+  *out = (int)v;
+  return 0;
+}
+
 
 
 PrepareResult prepare_select(InputBuffer* in, Statement* st, Table* table) {
@@ -193,16 +264,45 @@ PrepareResult prepare_select(InputBuffer* in, Statement* st, Table* table) {
     s++;
   }
 
-  // Parse projection: "*" or "col1,col2,..."
+  // Decide schema for SELECT (FROM table overrides current active_schema)
+  char* proj_start = s;
+  char* from_kw = strstr(proj_start, " from ");
+  char* where_kw = strstr(proj_start, " where ");
+
+  const TableSchema* schema_for_select = &table->active_schema;
+  char from_table_buf[MAX_TABLE_NAME_LEN] = {0};
+  if (from_kw != NULL) {
+    // Parse table name after " from " to choose schema for projection/where
+    char* p = from_kw + 6; // skip leading space + 'from '
+    while (*p == ' ' || *p == '\t') {
+      p++;
+    }
+    char* name_end = p;
+    while (*name_end && *name_end != ' ' && *name_end != '\t') {
+      name_end++;
+    }
+    size_t name_len = (size_t)(name_end - p);
+    if (name_len >= MAX_TABLE_NAME_LEN) name_len = MAX_TABLE_NAME_LEN - 1;
+    strncpy(from_table_buf, p, name_len);
+    from_table_buf[name_len] = '\0';
+
+    TableSchema tmp;
+    if (lookup_table_schema(table->pager, from_table_buf, &tmp) != 0) {
+      printf("Table not found: %s\n", from_table_buf);
+      return PREPARE_SYNTAX_ERROR;
+    }
+    schema_for_select = &tmp; // use temp schema for validation
+    // Record target table for execution time switch
+    strncpy(st->target_table, from_table_buf, MAX_TABLE_NAME_LEN - 1);
+    st->target_table[MAX_TABLE_NAME_LEN - 1] = '\0';
+  }
+
+  // Parse projection: "*" or "col1,col2,..." (validated against schema_for_select)
   if (*s == '*') {
     // "*" means proj_count = 0 (print all columns)
     s++;
   } else {
-    // Determine the slice of projection list before " from " or " where " or end
-    char* proj_start = s;
-    char* from_kw = strstr(proj_start, " from ");
-    char* where_kw = strstr(proj_start, " where ");
-
+    // Determine the slice of projection list before FROM/WHERE/end
     char* proj_end = NULL;
     if (from_kw != NULL) {
       proj_end = from_kw;
@@ -226,44 +326,17 @@ PrepareResult prepare_select(InputBuffer* in, Statement* st, Table* table) {
       while (*tok == ' ' || *tok == '\t') {
         tok++;
       }
-
-      int col_index = schema_col_index(&table->active_schema, tok);
+      int col_index = schema_col_index(schema_for_select, tok);
       if (col_index < 0) {
         printf("Unknown column: %s\n", tok);
         return PREPARE_SYNTAX_ERROR;
       }
-
       st->proj_indices[st->proj_count++] = col_index;
       tok = strtok(NULL, ",");
     }
 
-    // Advance s past the projection slice
-    s = proj_end;
-  }
-
-  // Optional: FROM <table>
-  while (*s == ' ' || *s == '\t') {
-    s++;
-  }
-  if (strncmp(s, "from ", 5) == 0) {
-    s += 5;
-    while (*s == ' ' || *s == '\t') {
-      s++;
-    }
-
-    char* name_end = s;
-    while (*name_end && *name_end != ' ' && *name_end != '\t') {
-      name_end++;
-    }
-
-    size_t name_len = (size_t)(name_end - s);
-    if (name_len >= MAX_TABLE_NAME_LEN) {
-      name_len = MAX_TABLE_NAME_LEN - 1;
-    }
-    strncpy(st->target_table, s, name_len);
-    st->target_table[name_len] = '\0';
-
-    s = name_end;
+    // After projection slice, move s to WHERE if present, otherwise to proj_end
+    s = (where_kw != NULL) ? where_kw : proj_end;
   }
 
   // Optional: WHERE <col> = <val>
@@ -309,8 +382,8 @@ PrepareResult prepare_select(InputBuffer* in, Statement* st, Table* table) {
     }
     val[vi] = '\0';
 
-    // Map column and store predicate
-    int idx = schema_col_index(&table->active_schema, col_name);
+    // Map column and store predicate (use schema_for_select)
+    int idx = schema_col_index(schema_for_select, col_name);
     if (idx < 0) {
       printf("Unknown column: %s\n", col_name);
       return PREPARE_SYNTAX_ERROR;
@@ -319,7 +392,7 @@ PrepareResult prepare_select(InputBuffer* in, Statement* st, Table* table) {
     st->has_where = true;
     st->where_col_index = idx;
 
-    if (table->active_schema.columns[idx].type == COL_TYPE_INT) {
+    if (schema_for_select->columns[idx].type == COL_TYPE_INT) {
       int v = 0;
       if (parse_int(val, &v) != 0) {
         printf("Invalid int: %s\n", val);
@@ -351,26 +424,11 @@ const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
 const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
 const uint32_t PAGE_SIZE = 4096;
-#define TABLE_MAX_PAGES 400
 
 #define INVALID_PAGE_NUM UINT32_MAX
 
-typedef struct {
-  int file_descriptor;
-  uint32_t file_length;
-  uint32_t num_pages;
-  void* pages[TABLE_MAX_PAGES];
-} Pager;
-
 /* schema types already defined above */
 
-typedef struct {
-  Pager* pager;
-  uint32_t root_page_num;
-
-  TableSchema active_schema;
-  uint32_t row_size;
-} Table;
 
 
 static inline uint32_t compute_row_size(const TableSchema* s){
@@ -437,6 +495,8 @@ void set_node_root(void* node, bool is_root);
 uint32_t get_unused_page_num(Pager* pager);
 static void serialize_row_dynamic(Table* t, char* const* values, uint32_t n, void* dest);
 static void print_row_dynamic(Table* t, const void* src);
+// lookup helper used by prepare_select; implemented after catalog types
+int lookup_table_schema(Pager* pager, const char* name, TableSchema* out_schema);
 
 
 /* duplicated defines removed */
@@ -490,6 +550,15 @@ static int catalog_find(Pager* pager, const char* name){
     }
   }
   return -1;
+}
+
+// non-static helper for early use (we declared a prototype earlier)
+int lookup_table_schema(Pager* pager, const char* name, TableSchema* out_schema){
+  int idx = catalog_find(pager, name);
+  if(idx < 0) return -1;
+  CatalogEntry* ents = catalog_entries(pager);
+  *out_schema = ents[idx].schema;
+  return 0;
 }
 
 static int catalog_add_table(Pager* pager, const TableSchema* schema,uint32_t root_page_num){
@@ -1258,7 +1327,7 @@ PrepareResult prepare_statement(InputBuffer* input_buffer,
       return PREPARE_UNRECOGNIZED_STATEMENT;
     }
   }
-  if (strncmp(s, "select") == 0) {
+  if (strncmp(s, "select" , 6) == 0) {
     return prepare_select(input_buffer, statement, table);
   }
 
@@ -1558,23 +1627,6 @@ void leaf_node_insert(Cursor* cursor, uint32_t key, char* const* values, uint32_
 
 
 
-
-
-static int parse_int(const char* s,int* out){
-  char* end = NULL;
-  long v = strtol(s,&end,10);
-  if(end == s || *end != '\0'){
-    return -1;
-  }
-  if(v < INT32_MIN || v > INT32_MAX){
-    return -1;
-  }
-  *out = (int)v;
-  return 0;
-}
-
-
-
 static void serialize_row_dynamic(Table* t,char* const* values,uint32_t n, void* dest){
   uint8_t* p = (uint8_t*)dest;
   for(uint32_t i = 0 ; i < t->active_schema.num_columns ; i++){
@@ -1595,38 +1647,6 @@ static void serialize_row_dynamic(Table* t,char* const* values,uint32_t n, void*
       p += c->size;
     }
   }
-}
-
-
-static void print_row_dynamic(Table* t,const void* src){
-  const uint8_t* p = (const uint8_t*)src;
-  printf("(");
-  for(uint32_t i = 0 ; i < t->active_schema.num_columns ; i++){
-    const ColumnDef* c = &t->active_schema.columns[i];
-    if(i){
-      printf(", ");
-    }
-
-    if(c->type == COL_TYPE_INT){
-      int v;
-      memcpy(&v,p,4);
-      p+=4;
-      printf("%d",v);
-    } else {
-      char buf[512];
-      size_t m = c->size < sizeof(buf)-1? c->size : sizeof(buf)-1;
-      memcpy(buf,p,m);
-      buf[m]=0;
-      size_t r = m;
-      while (r > 0 && buf[r - 1] == 0) {
-        r--;
-      }
-      buf[r] = 0;
-      printf("%s",buf);
-      p += c->size;
-    }
-  }
-  printf(")\n");
 }
 
 
