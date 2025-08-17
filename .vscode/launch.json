@@ -6,7 +6,7 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/implement/db",
-            "args": ["mydb.db"],
+            "args": ["select_test.db"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],

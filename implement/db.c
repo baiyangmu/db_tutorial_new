@@ -8,7 +8,17 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <limits.h>
+#include "sql_parser.h"
+#include "sql_ast.h"
 
+static Expr* g_last_parsed_expr = NULL;
+
+static void set_last_parsed_expr(Expr* e){
+  if(g_last_parsed_expr){
+    expr_free(g_last_parsed_expr);
+  }
+  g_last_parsed_expr = e;
+}
 
 typedef struct {
   char* buffer;
@@ -160,7 +170,9 @@ static void row_get_string(Table* t,const void* row, int col_idx, char* out,size
 
 
 static bool row_matches_where(Table* t,const void* row, const Statement* st){
-  if(!st->has_where) return true;
+  if (!st->has_where) {
+    return true;
+  }
   if(st->where_is_string){
     char buf[512];
     row_get_string(t,row,st->where_col_index,buf,sizeof(buf));
@@ -555,7 +567,9 @@ static int catalog_find(Pager* pager, const char* name){
 // non-static helper for early use (we declared a prototype earlier)
 int lookup_table_schema(Pager* pager, const char* name, TableSchema* out_schema){
   int idx = catalog_find(pager, name);
-  if(idx < 0) return -1;
+  if (idx < 0) {
+    return -1;
+  }
   CatalogEntry* ents = catalog_entries(pager);
   *out_schema = ents[idx].schema;
   return 0;
@@ -590,35 +604,65 @@ ColumType parse_column_type(const char* type_str){
 }
 
 // ADD this new function (keep your parser logic; just append the persistence part at the end)
-int handle_create_table_ex(Table* runtime_table, const char* sql){
+int handle_create_table_ex(Table* runtime_table, const char* sql) {
   // parse with your existing code (you can call handle_create_table's parsing body)
   // Below is your original body until schema.num_columns check..
-  const char* p = strstr(sql,"table");
-  if(!p) return -1;
-  p += 5; while(*p == ' ') p++;
-  char table_name[MAX_TABLE_NAME_LEN] = {0};
-  sscanf(p,"%s",table_name);
-  p = strchr(p,'('); if(!p) return -1;
-  p++;
-  TableSchema schema = (TableSchema){0};
-  strncpy(schema.name,table_name,MAX_TABLE_NAME_LEN - 1);
-  char coldef[256]; int col = 0;
-  while (sscanf(p," %[^,)]",coldef) == 1 && col < MAX_COLUMNS) {
-    char colname[MAX_COLUMN_NAME_LEN], coltype[16];
-    if (sscanf(coldef,"%s %s", colname, coltype) != 2) break;
-    strncpy(schema.columns[col].name, colname, MAX_COLUMN_NAME_LEN - 1);
-    schema.columns[col].type = parse_column_type(coltype);
-    schema.columns[col].size = (schema.columns[col].type == COL_TYPE_STRING) ? 255 : 4;
-    schema.num_columns++; col++;
-    p = strchr(p,','); if(!p) break; p++;
+  const char* p = strstr(sql, "table");
+  if (!p) {
+    return -1;
   }
-  if (schema.num_columns == 0) return -2;
+
+  p += 5;
+  while (*p == ' ') p++;
+
+  char table_name[MAX_TABLE_NAME_LEN] = {0};
+  sscanf(p, "%s", table_name);
+
+  p = strchr(p, '(');
+  if (!p) {
+    return -1;
+  }
+  p++;
+
+  TableSchema schema = (TableSchema){0};
+  strncpy(schema.name, table_name, MAX_TABLE_NAME_LEN - 1);
+
+  char coldef[256];
+  int col = 0;
+
+  while (sscanf(p, " %[^,)]", coldef) == 1 && col < MAX_COLUMNS) {
+      char colname[MAX_COLUMN_NAME_LEN], coltype[16];
+
+      if (sscanf(coldef, "%s %s", colname, coltype) != 2) {
+          break;
+      }
+
+      strncpy(schema.columns[col].name, colname, MAX_COLUMN_NAME_LEN - 1);
+      schema.columns[col].type = parse_column_type(coltype);
+      schema.columns[col].size = (schema.columns[col].type == COL_TYPE_STRING) ? 255 : 4;
+
+      schema.num_columns++;
+      col++;
+
+      p = strchr(p, ',');
+      if (!p) break;
+      p++;
+  }
+
+  if (schema.num_columns == 0) {
+    return -2;
+  }
 
   // Optional: ensure schema matches fixed Row layout for now
-  if (schema.num_columns != 3) { printf("Only 3 columns (id, username, email) supported now.\n"); return -6; }
+  if (schema.num_columns != 3) {
+      printf("Only 3 columns (id, username, email) supported now.\n");
+      return -6;
+  }
 
   // check duplicate
-  if (catalog_find(runtime_table->pager, schema.name) >= 0) return -4;
+  if (catalog_find(runtime_table->pager, schema.name) >= 0) {
+      return -4;
+  }
 
   // allocate root page for this table
   uint32_t root = get_unused_page_num(runtime_table->pager);
@@ -627,12 +671,13 @@ int handle_create_table_ex(Table* runtime_table, const char* sql){
   set_node_root(root_node, true);
 
   // persist into catalog
-  if (catalog_add_table(runtime_table->pager, &schema, root) != 0) return -5;
+  if (catalog_add_table(runtime_table->pager, &schema, root) != 0) {
+      return -5;
+  }
 
   printf("Table '%s' created with %d columns.\n", schema.name, schema.num_columns);
   return 0;
 }
-
 
 
 int handle_create_table(const char* sql){
@@ -1220,6 +1265,10 @@ void db_close(Table* table) {
   }
   free(pager);
   free(table);
+  if (g_last_parsed_expr) {
+    expr_free(g_last_parsed_expr);
+    g_last_parsed_expr = NULL;
+  }
 }
 
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
@@ -1328,7 +1377,43 @@ PrepareResult prepare_statement(InputBuffer* input_buffer,
     }
   }
   if (strncmp(s, "select" , 6) == 0) {
-    return prepare_select(input_buffer, statement, table);
+    ParsedStmt ps;
+    if(parse_sql_to_parsed_stmt(input_buffer->buffer,&ps) != 0){
+      return PREPARE_SYNTAX_ERROR;
+    }
+    if(ps.kind != PARSED_SELECT){
+      parsed_stmt_free(&ps);
+      return PREPARE_SYNTAX_ERROR;
+    }
+
+    if(ps.table_name[0]){
+      strncpy(statement->target_table,ps.table_name,MAX_TABLE_NAME_LEN  -1);
+      statement->target_table[MAX_TABLE_NAME_LEN-1] = '\0';
+    }else{
+      statement->target_table[0] = '\0';
+    }
+
+    statement->proj_count = 0;
+    if(ps.select_all){
+      statement->proj_count = 0;
+    }else{
+      for(uint32_t i = 0 ; i < ps.proj_count ; i++ ){
+        int idx = schema_col_index(&table->active_schema,ps.proj_list[i]);
+        if(idx < 0){
+          printf("Unknown column: %s\n", ps.proj_list[i]);
+          parsed_stmt_free(&ps);
+          return PREPARE_SYNTAX_ERROR;
+        }
+        statement->proj_indices[statement->proj_count++] = idx;
+      }
+    }
+
+    set_last_parsed_expr(ps.where);
+    ps.where = NULL;
+
+    parsed_stmt_free(&ps);
+    return PREPARE_SUCCESS;
+
   }
 
   return PREPARE_UNRECOGNIZED_STATEMENT;
@@ -1458,19 +1543,6 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num,
 
   uint32_t new_page_num = get_unused_page_num(table->pager);
 
-  /*
-  Declaring a flag before updating pointers which
-  records whether this operation involves splitting the root -
-  if it does, we will insert our newly created node during
-  the step where the table's new root is created. If it does
-  not, we have to insert the newly created node into its parent
-  after the old node's keys have been transferred over. We are not
-  able to do this if the newly created node's parent is not a newly
-  initialized root node, because in that case its parent may have existing
-  keys aside from our old node which we are splitting. If that is true, we
-  need to find a place for our newly created node in its parent, and we
-  cannot insert it at the correct index if it does not yet have any keys
-  */
   uint32_t splitting_root = is_node_root(old_node);
 
   void* parent;
@@ -1694,6 +1766,172 @@ ExecuteResult execute_insert(Statement* st, Table* table) {
   return EXECUTE_SUCCESS;
 }
 
+static int eval_expr_to_bool(Table* t, const void* row, Expr* e) {
+  if (!e) {
+    return 1;
+  }
+
+  switch (e->kind) {
+  case EXPR_LITERAL: {
+    if (strlen(e->text) == 0) return 0;
+    if (strcmp(e->text, "0") == 0) return 0;
+    return 1;
+  }
+
+  case EXPR_COLUMN: {
+    int idx = schema_col_index(&t->active_schema, e->text);
+    if (idx < 0) {
+      return 0;
+    }
+    if (t->active_schema.columns[idx].type == COL_TYPE_INT) {
+      int v = row_get_int(t, row, idx);
+      return v != 0;
+    } else {
+      char buf[512];
+      row_get_string(t, row, idx, buf, sizeof(buf));
+      return buf[0] != '\0';
+    }
+  }
+
+  case EXPR_UNARY: {
+    if (strcmp(e->op, "NOT") == 0) {
+      return !eval_expr_to_bool(t, row, e->left);
+    }
+    return 0;
+  }
+
+  case EXPR_BINARY: {
+    if (strcmp(e->op, "AND") == 0) {
+      return eval_expr_to_bool(t, row, e->left) && eval_expr_to_bool(t, row, e->right);
+    }
+    if (strcmp(e->op, "OR") == 0) {
+      return eval_expr_to_bool(t, row, e->left) || eval_expr_to_bool(t, row, e->right);
+    }
+
+    int lhs_int = 0;
+    int rhs_int = 0;
+    char lhs_s[512] = {0};
+    char rhs_s[512] = {0};
+    int is_num = 0;
+
+    if (e->left->kind == EXPR_COLUMN) {
+      int idx = schema_col_index(&t->active_schema, e->left->text);
+      if (idx >= 0 && t->active_schema.columns[idx].type == COL_TYPE_INT) {
+        lhs_int = row_get_int(t, row, idx);
+        is_num = 1;
+      } else {
+        row_get_string(t, row, idx, lhs_s, sizeof(lhs_s));
+      }
+
+    } else if (e->left->kind == EXPR_LITERAL) {
+      if (parse_int(e->left->text, &lhs_int) == 0) {
+        is_num = 1;
+      } else {
+        strncpy(lhs_s, e->left->text, sizeof(lhs_s) - 1);
+        lhs_s[sizeof(lhs_s) - 1] = '\0';
+      }
+    }
+
+    if (e->right->kind == EXPR_COLUMN) {
+      int idx = schema_col_index(&t->active_schema, e->right->text);
+      if (idx >= 0 && t->active_schema.columns[idx].type == COL_TYPE_INT) {
+        rhs_int = row_get_int(t, row, idx);
+        is_num = 1;
+      } else {
+        row_get_string(t, row, idx, rhs_s, sizeof(rhs_s));
+      }
+    } else if (e->right->kind == EXPR_LITERAL) {
+      if (parse_int(e->right->text, &rhs_int) == 0) {
+        is_num = 1;
+      } else {
+        strncpy(rhs_s, e->right->text, sizeof(rhs_s) - 1);
+        rhs_s[sizeof(rhs_s) - 1] = '\0';
+      }
+    }
+
+    if (is_num) {
+      if (strcmp(e->op, "=") == 0) return lhs_int == rhs_int;
+      if (strcmp(e->op, "!=") == 0) return lhs_int != rhs_int;
+      if (strcmp(e->op, "<") == 0) return lhs_int < rhs_int;
+      if (strcmp(e->op, "<=") == 0) return lhs_int <= rhs_int;
+      if (strcmp(e->op, ">") == 0) return lhs_int > rhs_int;
+      if (strcmp(e->op, ">=") == 0) return lhs_int >= rhs_int;
+    } else {
+      if (strcmp(e->op, "=") == 0) return strcmp(lhs_s, rhs_s) == 0;
+      if (strcmp(e->op, "!=") == 0) return strcmp(lhs_s, rhs_s) != 0;
+      if (strcmp(e->op, "<") == 0) return strcmp(lhs_s, rhs_s) < 0;
+      if (strcmp(e->op, ">") == 0) return strcmp(lhs_s, rhs_s) > 0;
+      if (strcmp(e->op, "<=") == 0) return strcmp(lhs_s, rhs_s) <= 0;
+      if (strcmp(e->op, ">=") == 0) return strcmp(lhs_s, rhs_s) >= 0;
+    }
+    return 0;
+  }
+
+  case EXPR_BETWEEN: {
+    Expr* val = e->left;
+    Expr* low = e->right->left;
+    Expr* high = e->right->right;
+
+    int v = 0, l = 0, h = 0;
+    char vs[512] = {0}, ls[512] = {0}, hs[512] = {0};
+    int is_num = 0;
+    if (val->kind == EXPR_COLUMN) {
+      int idx = schema_col_index(&t->active_schema, val->text);
+      if (idx >= 0 && t->active_schema.columns[idx].type == COL_TYPE_INT) {
+        v = row_get_int(t, row, idx);
+        is_num = 1;
+      } else {
+        row_get_string(t, row, idx, vs, sizeof(vs));
+      }
+    }
+
+    if (low->kind == EXPR_LITERAL) {
+      if (parse_int(low->text, &l) == 0) {
+        is_num = 1;
+      } else {
+        strncpy(ls, low->text, sizeof(ls) - 1);
+        ls[sizeof(ls) - 1] = '\0';
+      }
+    }
+
+    if (high->kind == EXPR_LITERAL) {
+      if (parse_int(high->text, &h) == 0) {
+        is_num = 1;
+      } else {
+        strncpy(hs, high->text, sizeof(hs) - 1);
+        hs[sizeof(hs) - 1] = '\0';
+      }
+    }
+
+    if (is_num) {
+      return (v >= l && v <= h);
+    }
+    return (strcmp(vs, ls) >= 0 && strcmp(vs, hs) <= 0);
+  }
+
+  case EXPR_ISNULL: {
+    Expr* target = e->left;
+    if (target->kind == EXPR_COLUMN) {
+      int idx = schema_col_index(&t->active_schema, target->text);
+      if (idx < 0) {
+        return 0;
+      }
+      if (t->active_schema.columns[idx].type == COL_TYPE_INT) {
+        return 0;
+      } else {
+        char buf[512];
+        row_get_string(t, row, idx, buf, sizeof(buf));
+        int isnull = (buf[0] == '\0');
+        if (strcmp(e->op, "IS NOT") == 0) return !isnull;
+        return isnull;
+      }
+    }
+    return 0;
+  }
+  }
+  return 0;
+}
+
 
 ExecuteResult execute_select(Statement* st, Table* table) {
 
@@ -1715,14 +1953,49 @@ ExecuteResult execute_select(Statement* st, Table* table) {
     return EXECUTE_SUCCESS;
   }
 
-   // where 命中主键（第0列为 int）时走 B-Tree 精确定位
-  bool can_point_lookup = 
-       st->has_where &&
-       (st->where_col_index == 0) &&
-       !st->where_is_string &&
-       (table->active_schema.columns[0].type == COL_TYPE_INT);
+  bool can_point_lookup = false;
+  uint32_t lookup_key = 0;
 
-  
+  extern Expr* g_last_parsed_expr;
+  Expr* ast = g_last_parsed_expr;
+
+  if(ast && ast->kind == EXPR_BINARY && strcmp(ast->op,"=") == 0){
+    Expr* left = ast->left;
+    Expr* right = ast->right;
+    Expr* colExpr = NULL;
+    Expr* litExpr = NULL;
+
+    if(left && left->kind == EXPR_COLUMN && right && right->kind == EXPR_LITERAL){
+      colExpr = left;
+      litExpr = right;
+    }else if(right && right->kind == EXPR_COLUMN && left && left->kind == EXPR_LITERAL){
+      colExpr = right;
+      litExpr = left; 
+    }
+
+    if(colExpr && litExpr){
+      int col_idx = schema_col_index(&table->active_schema,colExpr->text);
+      if(col_idx == 0 && table->active_schema.columns[0].type == COL_TYPE_INT){
+        int v = 0;
+        if(parse_int(litExpr->text,&v) == 0){
+          can_point_lookup = true;
+          lookup_key = (uint32_t)v;
+        }
+      }
+    }
+  }
+
+  //保留原来的检查逻辑
+  if (!can_point_lookup) {
+      if (st->has_where &&
+          (st->where_col_index == 0) &&
+          !st->where_is_string &&
+          (table->active_schema.columns[0].type == COL_TYPE_INT)) {
+          /* st->where_int holds parsed integer value in legacy flow */
+          can_point_lookup = true;
+          lookup_key = (uint32_t)st->where_int;
+      }
+  }
   if (can_point_lookup){
     uint32_t key = (uint32_t)st->where_int;
     Cursor* cursor = table_find(table,key);
@@ -1733,8 +2006,14 @@ ExecuteResult execute_select(Statement* st, Table* table) {
       uint32_t key_at_index = *leaf_key_t(table,node,cursor->cell_num);
       if(key_at_index == key){
         void* row = leaf_value_t(table,node,cursor->cell_num);
-        if(row_matches_where(table,row,st)){
-          print_row_projected(table,row,st->proj_indices,st->proj_count);
+        int pass = 1;
+        if (g_last_parsed_expr) {
+            pass = eval_expr_to_bool(table, row, g_last_parsed_expr);
+        } else if (st->has_where) {
+            pass = row_matches_where(table, row, st);
+        }
+        if (pass) {
+            print_row_projected(table, row, st->proj_indices, st->proj_count);
         }
       }
     }
