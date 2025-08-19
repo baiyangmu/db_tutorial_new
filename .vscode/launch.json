@@ -2,11 +2,11 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug db.c",
+            "name": "Debug mydb",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/implement/db",
-            "args": ["select_test.db"],
+            "program": "${workspaceFolder}/implement/mydb",
+            "args": ["test_run.db"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],

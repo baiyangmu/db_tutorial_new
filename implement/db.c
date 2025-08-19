@@ -256,7 +256,7 @@ static int parse_int(const char* s,int* out){
 }
 
 
-
+//在不使用 ast 解析的情况下，对特定语句进行直接解析
 PrepareResult prepare_select(InputBuffer* in, Statement* st, Table* table) {
   // Initialize statement
   st->type = STATEMENT_SELECT;
@@ -693,7 +693,7 @@ int handle_create_table(const char* sql){
   char table_name[MAX_TABLE_NAME_LEN] = {0};
   sscanf(p,"%s",table_name);
 
-  // 2.找到 ‘(’ 的位置
+  // 2.找到 '(' 的位置
   p = strchr(p,'(');
   if(!p){
     return -1;
@@ -1378,6 +1378,7 @@ PrepareResult prepare_statement(InputBuffer* input_buffer,
   }
   if (strncmp(s, "select" , 6) == 0) {
     ParsedStmt ps;
+    statement->type = STATEMENT_SELECT;
     if(parse_sql_to_parsed_stmt(input_buffer->buffer,&ps) != 0){
       return PREPARE_SYNTAX_ERROR;
     }
@@ -1945,7 +1946,6 @@ ExecuteResult execute_select(Statement* st, Table* table) {
     table->root_page_num = ents[idx].root_page_num;
     table->active_schema = ents[idx].schema;
     table->row_size = compute_row_size(&table->active_schema);
-
   }
 
   if(table->root_page_num == INVALID_PAGE_NUM){
@@ -1977,7 +1977,7 @@ ExecuteResult execute_select(Statement* st, Table* table) {
       int col_idx = schema_col_index(&table->active_schema,colExpr->text);
       if(col_idx == 0 && table->active_schema.columns[0].type == COL_TYPE_INT){
         int v = 0;
-        if(parse_int(litExpr->text,&v) == 0){
+        if (parse_int(litExpr->text, &v) == 0) {
           can_point_lookup = true;
           lookup_key = (uint32_t)v;
         }
@@ -1985,49 +1985,53 @@ ExecuteResult execute_select(Statement* st, Table* table) {
     }
   }
 
-  //保留原来的检查逻辑
+  /* legacy Statement where -> keep for compatibility */
   if (!can_point_lookup) {
-      if (st->has_where &&
-          (st->where_col_index == 0) &&
-          !st->where_is_string &&
-          (table->active_schema.columns[0].type == COL_TYPE_INT)) {
-          /* st->where_int holds parsed integer value in legacy flow */
-          can_point_lookup = true;
-          lookup_key = (uint32_t)st->where_int;
-      }
+    if (st->has_where &&
+        (st->where_col_index == 0) &&
+        !st->where_is_string &&
+        (table->active_schema.columns[0].type == COL_TYPE_INT)) {
+      can_point_lookup = true;
+      lookup_key = (uint32_t)st->where_int;
+    }
   }
-  if (can_point_lookup){
-    uint32_t key = (uint32_t)st->where_int;
-    Cursor* cursor = table_find(table,key);
-    void* node = get_page(table->pager,cursor->page_num);
+
+  if (can_point_lookup) {
+    Cursor* cursor = table_find(table, lookup_key);
+    void* node = get_page(table->pager, cursor->page_num);
     uint32_t num_cells = *leaf_node_num_cells(node);
 
-    if(cursor->cell_num < num_cells){
-      uint32_t key_at_index = *leaf_key_t(table,node,cursor->cell_num);
-      if(key_at_index == key){
-        void* row = leaf_value_t(table,node,cursor->cell_num);
+    if (cursor->cell_num < num_cells) {
+      uint32_t key_at_index = *leaf_key_t(table, node, cursor->cell_num);
+      if (key_at_index == lookup_key) {
+        void* row = leaf_value_t(table, node, cursor->cell_num);
         int pass = 1;
-        if (g_last_parsed_expr) {
-            pass = eval_expr_to_bool(table, row, g_last_parsed_expr);
+        if (ast) {
+          pass = eval_expr_to_bool(table, row, ast);
         } else if (st->has_where) {
-            pass = row_matches_where(table, row, st);
+          pass = row_matches_where(table, row, st);
         }
         if (pass) {
-            print_row_projected(table, row, st->proj_indices, st->proj_count);
+          print_row_projected(table, row, st->proj_indices, st->proj_count);
         }
       }
     }
     free(cursor);
     return EXECUTE_SUCCESS;
-
   }
 
-  // 否则全表扫描
+  /* full table scan: prefer AST evaluation, fallback to legacy row_matches_where */
   Cursor* cursor = table_start(table);
-  while (!(cursor->end_of_table)) {
+  while (!cursor->end_of_table) {
     void* row = cursor_value(cursor);
-    if (row_matches_where(table,row,st)){
-      print_row_projected(table,row,st->proj_indices,st->proj_count);
+    int pass = 1;
+    if (ast) {
+      pass = eval_expr_to_bool(table, row, ast);
+    } else if (st->has_where) {
+      pass = row_matches_where(table, row, st);
+    }
+    if (pass) {
+      print_row_projected(table, row, st->proj_indices, st->proj_count);
     }
     cursor_advance(cursor);
   }
