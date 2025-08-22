@@ -1,0 +1,9 @@
+Table 'users' created with 3 columns.
+Executed.
+Using table 'users'.
+Executed.
+Executed.
+(1, alice, alice@example.com)
+(2, bob, bob@example.com)
+(1, alice)
+Executed.
