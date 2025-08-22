@@ -10,7 +10,7 @@
 #include <limits.h>
 #include "sql_parser.h"
 #include "sql_ast.h"
-
+#include <time.h>
 
 typedef struct {
   char* buffer;
@@ -52,13 +52,14 @@ typedef struct {
 #define MAX_VALUES MAX_COLUMNS
 /* schema constants and typedefs MUST appear before Table/Statement */
 #define MAX_TABLES 32
-#define MAX_COLUMNS 16
+#define MAX_COLUMNS 100
 #define MAX_COLUMN_NAME_LEN 32
 #define MAX_TABLE_NAME_LEN 32
 
 typedef enum {
   COL_TYPE_INT,
-  COL_TYPE_STRING
+  COL_TYPE_STRING,
+  COL_TYPE_TIMESTAMP
 } ColumType;
 
 typedef struct {
@@ -155,6 +156,13 @@ static int row_get_int(Table* t,const void* row,int col_idx){
 }
 
 
+static int64_t row_get_timestamp(Table* t,const void* row,int col_idx){
+  uint32_t off = schema_col_offset(&t->active_schema,col_idx);
+  int64_t v;
+  memcpy(&v,(const uint8_t*)row+off,8);
+  return v;
+}
+
 static void row_get_string(Table* t,const void* row, int col_idx, char* out,size_t cap){
   uint32_t off = schema_col_offset(&t->active_schema,col_idx);
   size_t sz = t->active_schema.columns[col_idx].size;
@@ -200,7 +208,14 @@ static void print_row_dynamic(Table* t,const void* src){
       memcpy(&v,p,4);
       p+=4;
       printf("%d",v);
-    } else {
+    } else if(c->type == COL_TYPE_TIMESTAMP){
+      int64_t tv;
+      memcpy(&tv,p,8);
+      p += 8;
+      printf("%lld", (long long)tv);
+    }
+  
+    else {
       char buf[512];
       size_t m = c->size < sizeof(buf)-1? c->size : sizeof(buf)-1;
       memcpy(buf,p,m);
@@ -233,7 +248,11 @@ static void print_row_projected(Table* t, const void* row, const int* idxs, uint
     if(c->type == COL_TYPE_INT){
       int v = row_get_int(t,row,idxs[i]);
       printf("%d",v);
-    }else{
+    } else if(c->type == COL_TYPE_TIMESTAMP){
+      int64_t timestamp = row_get_timestamp(t,row,idxs[i]);
+      printf("%lld", (long long)timestamp); 
+    }
+    else{
       char s[512];
       row_get_string(t,row,idxs[i],s,sizeof(s));
       printf("%s",s);
@@ -254,6 +273,16 @@ static int parse_int(const char* s,int* out){
     return -1;
   }
   *out = (int)v;
+  return 0;
+}
+
+static int parse_int64(const char* s,int64_t* out){
+  char* end = NULL;
+  long long v = strtoll(s,&end,10);
+  if(end == s || *end != '\0'){
+    return -1;
+  }
+  *out = (int64_t)v;
   return 0;
 }
 
@@ -491,6 +520,7 @@ static inline uint32_t compute_row_size(const TableSchema* s){
     switch(s->columns[i].type){
       case COL_TYPE_INT: sz += 4;break;
       case COL_TYPE_STRING: sz += s->columns[i].size; break;
+      case COL_TYPE_TIMESTAMP: sz += 8; break;
     }
   }
   return sz;
@@ -642,13 +672,12 @@ uint32_t g_num_tables = 0;
 ColumType parse_column_type(const char* type_str){
    if(strcmp(type_str,"int") == 0) return COL_TYPE_INT;
     if(strcmp(type_str,"string") == 0) return COL_TYPE_STRING;
+    if(strcmp(type_str,"timestamp") == 0) return COL_TYPE_TIMESTAMP;
     return COL_TYPE_INT; // 默认返回int类型
 }
 
 // ADD this new function (keep your parser logic; just append the persistence part at the end)
 int handle_create_table_ex(Table* runtime_table, const char* sql) {
-  // parse with your existing code (you can call handle_create_table's parsing body)
-  // Below is your original body until schema.num_columns check..
   const char* p = strstr(sql, "table");
   if (!p) {
     return -1;
@@ -681,7 +710,13 @@ int handle_create_table_ex(Table* runtime_table, const char* sql) {
 
       strncpy(schema.columns[col].name, colname, MAX_COLUMN_NAME_LEN - 1);
       schema.columns[col].type = parse_column_type(coltype);
-      schema.columns[col].size = (schema.columns[col].type == COL_TYPE_STRING) ? 255 : 4;
+      if (schema.columns[col].type == COL_TYPE_STRING) {
+        schema.columns[col].size = 255;
+      } else if (schema.columns[col].type == COL_TYPE_TIMESTAMP) {
+          schema.columns[col].size = 8; /* 64-bit epoch seconds */
+      } else {
+          schema.columns[col].size = 4;
+      }
 
       schema.num_columns++;
       col++;
@@ -695,11 +730,11 @@ int handle_create_table_ex(Table* runtime_table, const char* sql) {
     return -2;
   }
 
-  // Optional: ensure schema matches fixed Row layout for now
-  if (schema.num_columns != 3) {
-      printf("Only 3 columns (id, username, email) supported now.\n");
-      return -6;
-  }
+  // // Optional: ensure schema matches fixed Row layout for now
+  // if (schema.num_columns != 3) {
+  //     printf("Only 3 columns (id, username, email) supported now.\n");
+  //     return -6;
+  // }
 
   // check duplicate
   if (catalog_find(runtime_table->pager, schema.name) >= 0) {
@@ -720,66 +755,6 @@ int handle_create_table_ex(Table* runtime_table, const char* sql) {
   printf("Table '%s' created with %d columns.\n", schema.name, schema.num_columns);
   return 0;
 }
-
-
-int handle_create_table(const char* sql){
-  // 1.解析表名
-  const char* p = strstr(sql,"table");
-  if(!p){
-    return -1;
-  }
-  p += 5;
-  while(*p == ' '){
-    p++;
-  }
-  char table_name[MAX_TABLE_NAME_LEN] = {0};
-  sscanf(p,"%s",table_name);
-
-  // 2.找到 '(' 的位置
-  p = strchr(p,'(');
-  if(!p){
-    return -1;
-  }
-
-  p++;
-
-  //3.解析字段
-  TableSchema schema = {0};
-  strncpy(schema.name,table_name,MAX_TABLE_NAME_LEN - 1);
-
-  char coldef[256];
-  int col = 0 ;
-  while(sscanf(p," %[^,)]",coldef) == 1 && col < MAX_COLUMNS){
-    char colname[MAX_COLUMN_NAME_LEN] , coltype[16];
-    if(sscanf(coldef,"%s %s", colname,coltype) != 2){
-      break;
-    }
-    strncpy(schema.columns[col].name, colname, MAX_COLUMN_NAME_LEN - 1);
-    schema.columns[col].type = parse_column_type(coltype);
-    schema.columns[col].size = (schema.columns[col].type == COL_TYPE_STRING) ? 255:4;
-    schema.num_columns++;
-    col++;
-    p = strchr(p,',');
-    if(!p){
-      break;
-    }
-    p++;
-  }
-
-  if(schema.num_columns == 0){
-    return -2;
-  }
-
-  //4.保存到全局
-  if(g_num_tables >= MAX_TABLES){
-    return -3;
-  }
-
-  g_table_schemas[g_num_tables++] = schema;
-  printf("Table '%s' created with %d columns.\n", schema.name, schema.num_columns);
-  return 0;
-}
-
 
 
 typedef struct {
@@ -1771,7 +1746,18 @@ static void serialize_row_dynamic(Table* t,char* const* values,uint32_t n, void*
       parse_int(val,&v);
       memcpy(p,&v,4);
       p += 4;
-    }else{
+    } else if(c->type == COL_TYPE_TIMESTAMP ){
+      int64_t tv = 0;
+      if(val == NULL || val[0] == '\0'){
+        tv = (int64_t)time(NULL); // default now
+      } else {
+        if(parse_int64(val,&tv) != 0){
+          tv = (int64_t)time(NULL);
+        }
+      }
+      memcpy(p,&tv,8);
+      p += 8;
+    } else{
       size_t len = strlen(val);
       size_t to_copy = len > c->size?c->size:len;
       memcpy(p,val,to_copy);
