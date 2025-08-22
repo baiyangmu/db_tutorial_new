@@ -11,14 +11,6 @@
 #include "sql_parser.h"
 #include "sql_ast.h"
 
-static Expr* g_last_parsed_expr = NULL;
-
-static void set_last_parsed_expr(Expr* e){
-  if(g_last_parsed_expr){
-    expr_free(g_last_parsed_expr);
-  }
-  g_last_parsed_expr = e;
-}
 
 typedef struct {
   char* buffer;
@@ -101,7 +93,6 @@ typedef struct {
 } Table;
 
 /* define MAX_VALUES after schema constants */
-#define MAX_VALUES MAX_COLUMNS
 #define MAX_SELECT_COLS MAX_COLUMNS
 
 typedef struct {
@@ -123,6 +114,14 @@ typedef struct {
   int where_int;
   char where_str[256]; // 拷贝一份用于比较
 
+  // where 的抽象树结构
+  Expr* where_ast;
+  bool has_limit;
+  uint32_t limit;
+  bool has_offset;
+  uint32_t offset;
+  int order_by_index; // -1 表示未指定
+  bool order_desc;
 } Statement;
 
 // Forward decls needed by prepare_select
@@ -182,6 +181,9 @@ static bool row_matches_where(Table* t,const void* row, const Statement* st){
     return v == st->where_int;
   }
 }
+
+
+
 
 
 static void print_row_dynamic(Table* t,const void* src){
@@ -253,6 +255,46 @@ static int parse_int(const char* s,int* out){
   }
   *out = (int)v;
   return 0;
+}
+
+
+
+
+typedef struct{
+  const void* row;
+} RowRef;
+
+
+static struct{
+  Table* table;
+  int col_idx;
+  int desc;
+} g_sort_ctx;
+
+
+static int rowref_comparator(const void* a,const void* b){
+  const RowRef* ra = (const RowRef*)a;
+  const RowRef* rb = (const RowRef*)b;
+  Table* t = g_sort_ctx.table;
+  int idx = g_sort_ctx.col_idx;
+  if(t->active_schema.columns[idx].type == COL_TYPE_INT){
+    int va = row_get_int(t,ra->row,idx);
+    int vb = row_get_int(t,rb->row,idx);
+    if(va < vb){
+      return g_sort_ctx.desc ? 1 : -1;
+    }
+    if(va > vb){
+      return g_sort_ctx.desc ? -1 : 1;
+    }
+    return 0;
+  }else {
+    char sa[512],sb[512];
+    row_get_string(t,ra->row,idx,sa,sizeof(sa));
+    row_get_string(t,rb->row,idx,sb,sizeof(sb));
+    int cmp = strcmp(sa,sb);
+    return g_sort_ctx.desc ? -cmp : cmp;
+  }
+
 }
 
 
@@ -1265,10 +1307,7 @@ void db_close(Table* table) {
   }
   free(pager);
   free(table);
-  if (g_last_parsed_expr) {
-    expr_free(g_last_parsed_expr);
-    g_last_parsed_expr = NULL;
-  }
+
 }
 
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
@@ -1340,6 +1379,7 @@ PrepareResult prepare_statement(InputBuffer* input_buffer,
 
   
   const char* s = input_buffer->buffer;
+  statement->where_ast = NULL;
   while(*s == ' ' || *s == '\t'){
     s++;
   }
@@ -1409,8 +1449,29 @@ PrepareResult prepare_statement(InputBuffer* input_buffer,
       }
     }
 
-    set_last_parsed_expr(ps.where);
+
+    statement->has_limit = ps.has_limit;
+    statement->limit = ps.limit;
+    statement->has_offset = ps.has_offset;
+    statement->offset = ps.offset;
+
+    if(ps.order_by[0]){
+      int ob_idx = schema_col_index(&table->active_schema,ps.order_by);
+      if(ob_idx < 0){
+        printf("Unknown column in ORDER BY: %s\n", ps.order_by);
+        parsed_stmt_free(&ps);
+        return PREPARE_SYNTAX_ERROR;
+      }
+      statement->order_by_index = ob_idx;
+      statement->order_desc = ps.order_desc ? true : false;
+    } else {
+      statement->order_by_index = -1;
+      statement->order_desc = false;
+    }
+
+    statement->where_ast = ps.where;
     ps.where = NULL;
+    
 
     parsed_stmt_free(&ps);
     return PREPARE_SUCCESS;
@@ -1956,8 +2017,7 @@ ExecuteResult execute_select(Statement* st, Table* table) {
   bool can_point_lookup = false;
   uint32_t lookup_key = 0;
 
-  extern Expr* g_last_parsed_expr;
-  Expr* ast = g_last_parsed_expr;
+  Expr* ast = st->where_ast;
 
   if(ast && ast->kind == EXPR_BINARY && strcmp(ast->op,"=") == 0){
     Expr* left = ast->left;
@@ -2020,22 +2080,58 @@ ExecuteResult execute_select(Statement* st, Table* table) {
     return EXECUTE_SUCCESS;
   }
 
-  /* full table scan: prefer AST evaluation, fallback to legacy row_matches_where */
+  /* full table scan -> collect matching rows */
+  RowRef* rows = NULL;
+  size_t nrows = 0;
+  size_t capacity = 0;
+
   Cursor* cursor = table_start(table);
-  while (!cursor->end_of_table) {
+  while(!cursor->end_of_table){
     void* row = cursor_value(cursor);
     int pass = 1;
-    if (ast) {
-      pass = eval_expr_to_bool(table, row, ast);
-    } else if (st->has_where) {
-      pass = row_matches_where(table, row, st);
+    if(ast){
+      pass = eval_expr_to_bool(table,row,ast);
+    } else if(st->has_where){
+      pass = row_matches_where(table,row,st);
     }
-    if (pass) {
-      print_row_projected(table, row, st->proj_indices, st->proj_count);
+
+    if(pass){
+      if(nrows == capacity){
+        size_t newcap = capacity ? capacity * 2 : 256;
+        RowRef* tmp = realloc(rows, newcap * sizeof(RowRef));
+        if(!tmp){
+          printf("Out of memory\n");
+          free(rows);
+          free(cursor);
+          return EXECUTE_SUCCESS;
+        }
+        rows = tmp;
+        capacity = newcap;
+      }
+      rows[nrows++].row = row;
     }
     cursor_advance(cursor);
   }
   free(cursor);
+
+  /* optional sort */
+  if (st->order_by_index >= 0 && nrows > 1) {
+    g_sort_ctx.table = table;
+    g_sort_ctx.col_idx = st->order_by_index;
+    g_sort_ctx.desc = st->order_desc ? 1 : 0;
+    qsort(rows, nrows, sizeof(RowRef), rowref_comparator);
+  }
+
+  /* apply offset/limit and print */
+  size_t start = st->has_offset ? st->offset : 0;
+  size_t end = st->has_limit ? (start + st->limit) : nrows;
+  if (start > nrows) start = nrows;
+  if (end > nrows) end = nrows;
+  for (size_t i = start; i < end; ++i) {
+    print_row_projected(table, rows[i].row, st->proj_indices, st->proj_count);
+  }
+
+  free(rows);
   return EXECUTE_SUCCESS;
 }
 
@@ -2045,6 +2141,11 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
       return execute_insert(statement, table);
     case (STATEMENT_SELECT):
       return execute_select(statement, table);
+  }
+
+  if (statement->where_ast) {
+    expr_free(statement->where_ast);
+    statement->where_ast = NULL;
   }
 }
 

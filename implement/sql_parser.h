@@ -32,6 +32,14 @@ typedef struct{
     char** insert_value;
     uint32_t insert_n;
 
+    uint32_t limit;
+    int has_limit;
+    uint32_t offset;
+    int has_offset;
+    char order_by[PARSED_MAX_PROJ_NAME_LEN];
+    int order_desc;
+    char table_alias[PARSED_TABLE_NAME_LEN];
+
 } ParsedStmt;
 
 int parse_sql_to_parsed_stmt(const char* sql,ParsedStmt* out);

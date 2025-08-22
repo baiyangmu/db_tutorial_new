@@ -195,6 +195,20 @@ void lexer_next(Lexer* lx){
             lx->cur.type = TOK_TABLE;
         } else if (strcmp(tmp, "USE") == 0) {
             lx->cur.type = TOK_USE;
+        } else if (strcmp(tmp, "ORDER") == 0) {
+            lx->cur.type = TOK_ORDER;
+        } else if (strcmp(tmp, "BY") == 0) {
+            lx->cur.type = TOK_BY;
+        } else if (strcmp(tmp, "LIMIT") == 0) {
+            lx->cur.type = TOK_LIMIT;
+        } else if (strcmp(tmp, "OFFSET") == 0) {
+            lx->cur.type = TOK_OFFSET;
+        } else if (strcmp(tmp, "ASC") == 0) {
+            lx->cur.type = TOK_ASC;
+        } else if (strcmp(tmp, "DESC") == 0) {
+            lx->cur.type = TOK_DESC;
+        } else if (strcmp(tmp, "AS") == 0) {
+            lx->cur.type = TOK_AS;
         } else {
             lx->cur.type = TOK_IDENT;
         }

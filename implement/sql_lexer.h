@@ -2,7 +2,6 @@
 #define SQL_LEXER_H
 
 #include <stddef.h>
-
 typedef enum{
     TOK_ILLEGAL,
     TOK_EOF,
@@ -37,6 +36,12 @@ typedef enum{
     TOK_CREATE,
     TOK_TABLE,
     TOK_USE,
+    TOK_ORDER,
+    TOK_BY,
+    TOK_LIMIT,
+    TOK_OFFSET,
+    TOK_ASC,
+    TOK_DESC,
     TOK_AS
 } TokenType;
 

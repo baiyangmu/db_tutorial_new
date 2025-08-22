@@ -280,6 +280,47 @@ static int parse_select(Parser* p,ParsedStmt* out){
         out->where = parse_expr(p);
     }
 
+    if(accept(lx,TOK_ORDER)){
+        if(!accept(lx,TOK_BY)){
+            return -1;
+        }
+        if(lx->cur.type != TOK_IDENT){
+            return -1;
+        }
+        strncpy(out->order_by,lx->cur.text,PARSED_MAX_PROJ_NAME_LEN-1);
+        out->order_by[PARSED_MAX_PROJ_NAME_LEN-1] = '\0';
+        lexer_next(lx);
+        out->order_desc = 0;
+        if(accept(lx,TOK_DESC)){
+            out->order_desc = 1;
+        } else {
+            accept(lx,TOK_ASC);
+        }
+    }
+
+
+    if(accept(lx,TOK_LIMIT)){
+        if(lx->cur.type != TOK_NUMBER){
+            return -1;
+        }
+        out->limit = (uint32_t)atoi(lx->cur.text);
+        out->has_limit = 1;
+        lexer_next(lx);
+        if(accept(lx,TOK_OFFSET)){
+            if(lx->cur.type != TOK_NUMBER){
+                return -1;
+            }
+            out->offset = (uint32_t)atoi(lx->cur.text);
+            out->has_offset = 1;
+            lexer_next(lx);
+        } else {
+            out->has_offset = 0;
+        }
+    } else {
+        out->has_limit = 0;
+        out->has_offset = 0;
+    }
+
     return 0;
 }
 
