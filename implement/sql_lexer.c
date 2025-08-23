@@ -209,7 +209,9 @@ void lexer_next(Lexer* lx){
             lx->cur.type = TOK_DESC;
         } else if (strcmp(tmp, "AS") == 0) {
             lx->cur.type = TOK_AS;
-        } else {
+        } else if (strcmp(tmp,"DELETE") == 0){
+            lx->cur.type = TOK_FROM;
+        }else {
             lx->cur.type = TOK_IDENT;
         }
 

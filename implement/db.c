@@ -37,7 +37,7 @@ typedef enum {
   PREPARE_CREATE_TABLE_DONE
 } PrepareResult;
 
-typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
+typedef enum { STATEMENT_INSERT, STATEMENT_SELECT,STATEMENT_DELETE } StatementType;
 
 #define COLUMN_USERNAME_SIZE 32
 #define COLUMN_EMAIL_SIZE 255
@@ -1318,7 +1318,7 @@ static void collect_values(char* start,Statement* st){
 }
 
 
-PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* st,Table* table){
+PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* st){
   st->type = STATEMENT_INSERT;
 
   char* s = input_buffer->buffer;
@@ -1380,7 +1380,7 @@ PrepareResult prepare_statement(InputBuffer* input_buffer,
   }
 
   if (strncmp(s, "insert", 6) == 0) {
-    return prepare_insert(input_buffer, statement,table);
+    return prepare_insert(input_buffer, statement);
   }
   if (strncmp(s, "create table", 12) == 0) {
     int ret = handle_create_table_ex(table,input_buffer->buffer);
@@ -1452,6 +1452,28 @@ PrepareResult prepare_statement(InputBuffer* input_buffer,
     return PREPARE_SUCCESS;
 
   }
+  if (strncmp(s,"delete",6) == 0){
+    ParsedStmt ps;
+    if(parse_sql_to_parsed_stmt(input_buffer->buffer,&ps) != 0){
+      return PREPARE_SYNTAX_ERROR;
+    }
+    if(ps.kind != PARSED_DELETE){
+      parsed_stmt_free(&ps);
+      return PREPARE_SYNTAX_ERROR;
+    }
+    statement->type = STATEMENT_DELETE;
+    if(ps.table_name[0]){
+      strncpy(statement->target_table,ps.table_name,MAX_TABLE_NAME_LEN-1);
+      statement->target_table[MAX_TABLE_NAME_LEN-1] = '\0';
+    }else{
+      statement->target_table[0] = '\0';
+    }
+    statement->where_ast = ps.where;
+    ps.where = NULL;
+
+    parsed_stmt_free(&ps);
+    return PREPARE_SUCCESS;
+  }
 
   return PREPARE_UNRECOGNIZED_STATEMENT;
 }
@@ -1487,7 +1509,7 @@ void create_new_root(Table* table, uint32_t right_child_page_num) {
 
   if (get_node_type(left_child) == NODE_INTERNAL) {
     void* child;
-    for (int i = 0; i < *internal_node_num_keys(left_child); i++) {
+    for (uint32_t i = 0; i < *internal_node_num_keys(left_child); i++) {
       child = get_page(table->pager, *internal_node_child(left_child,i));
       *node_parent(child) = left_child_page_num;
     }
@@ -1614,7 +1636,7 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num,
   /*
   For each key until you get to the middle key, move the key and the child to the new node
   */
-  for (int i = INTERNAL_NODE_MAX_KEYS - 1; i > INTERNAL_NODE_MAX_KEYS / 2; i--) {
+  for (uint32_t i = INTERNAL_NODE_MAX_KEYS - 1; i > INTERNAL_NODE_MAX_KEYS / 2; i--) {
     cur_page_num = *internal_node_child(old_node, i);
     cur = get_page(table->pager, cur_page_num);
 
@@ -1671,9 +1693,9 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, char* const* value
   evenly between old (left) and new (right) nodes.
   Starting from the right, move each key to correct position.
   */
-  for (int32_t i = (int32_t)leaf_max_cells(cursor->table); i >= 0; i--) {
+  for (uint32_t i = (uint32_t)leaf_max_cells(cursor->table); i >= 0; i--) {
     void* destination_node;
-    if (i >= (int32_t)leaf_left_split_count(cursor->table)) {
+    if (i >= (uint32_t)leaf_left_split_count(cursor->table)) {
       destination_node = new_node;
     } else {
       destination_node = old_node;
@@ -1813,6 +1835,116 @@ ExecuteResult execute_insert(Statement* st, Table* table) {
   free(cursor);
   return EXECUTE_SUCCESS;
 }
+
+ExecuteResult execute_delete(Statement* st,Table* table){
+  if(st->target_table[0]){
+    int idx = catalog_find(table->pager,st->target_table);
+    if(idx < 0){
+      printf("Table not found: %s\n", st->target_table);
+      return EXECUTE_SUCCESS;
+    }
+    CatalogEntry* ents = catalog_entries(table->pager);
+    table->root_page_num = ents[idx].root_page_num;
+    table->active_schema = ents[idx].schema;
+    table->row_size = compute_row_size(&table->active_schema);    
+  }
+
+  if(table->root_page_num == INVALID_PAGE_NUM){
+    printf("No active table. Use 'use <table>' or 'create table..' first.\n");
+    return EXECUTE_SUCCESS;
+  }
+
+  uint32_t key = 0;
+  int have_key = 0;
+
+  if(st->where_ast){
+    Expr* ast = st->where_ast;
+    if(ast && ast->kind == EXPR_BINARY && strcmp(ast->op,"=") == 0){
+      Expr* left = ast->left;
+      Expr* right = ast->right;
+      Expr* colExpr = NULL;
+      Expr* litExpr = NULL;
+  
+      if(left && left->kind == EXPR_COLUMN  && right && right->kind == EXPR_LITERAL){
+        colExpr = left;
+        litExpr = right;
+      } else if (right && right->kind == EXPR_COLUMN && left && left->kind == EXPR_LITERAL ){
+        colExpr = right;
+        litExpr = left;
+      }
+  
+      if(colExpr && litExpr){
+        int col_idx = schema_col_index(&table->active_schema,colExpr->text);
+        if(col_idx == 0 && table->active_schema.columns[0].type == COL_TYPE_INT){
+          int v = 0;
+          if(parse_int(litExpr->text,&v) == 0){
+            key = (uint32_t)v;
+            have_key = 1;
+          }
+        }
+      }
+    }
+  }
+
+  if(!have_key){
+    if(st->has_where && st->where_col_index == 0 && !st->where_is_string &&
+      table->active_schema.columns[0].type == COL_TYPE_INT){
+        key = (uint32_t)st->where_int;
+        have_key = 1;
+      }
+  }
+
+  if (!have_key) {
+    printf("Only DELETE by integer primary key is supported.\n");
+    return EXECUTE_SUCCESS;
+  }
+
+  Cursor* cursor = table_find(table,key);
+  void* node = get_page(table->pager,cursor->page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  if(cursor->cell_num >= num_cells){
+    free(cursor);
+    return EXECUTE_SUCCESS;
+  }
+  uint32_t key_at_index = *leaf_key_t(table,node,cursor->cell_num);
+  if(key_at_index != key){
+    free(cursor);
+    return EXECUTE_SUCCESS;
+  }
+
+  uint32_t old_leaf_max = get_node_max_key(table->pager,node);
+
+  for(uint32_t i = cursor->cell_num ; i < num_cells - 1; i++){
+    void* dest = leaf_cell_t(table, node, i);
+    void* src = leaf_cell_t(table, node, i + 1);
+    memcpy(dest, src, leaf_cell_size(table));
+  }
+  void* last_cell = leaf_cell_t(table,node,num_cells-1);
+  memset(last_cell, 0 , leaf_cell_size(table));
+  *(leaf_node_num_cells(node)) = num_cells - 1;
+
+
+  uint32_t new_max = 0;
+  uint32_t new_num = *leaf_node_num_cells(node);
+  if(new_num > 0){
+    new_max = *leaf_node_key(node,new_num -1);
+  } else {
+    new_max = 0;
+  }
+
+  if(old_leaf_max != new_max){
+    if(!is_node_root(node)){
+      uint32_t parent_page = *node_parent(node);
+      void* parent = get_page(table->pager,parent_page);
+      update_internal_node_key(parent,old_leaf_max,new_max);
+    }
+  }
+
+  free(cursor);
+  return EXECUTE_SUCCESS;
+}
+
+
 
 static int eval_expr_to_bool(Table* t, const void* row, Expr* e) {
   if (!e) {
@@ -2127,6 +2259,8 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
       return execute_insert(statement, table);
     case (STATEMENT_SELECT):
       return execute_select(statement, table);
+    case (STATEMENT_DELETE):
+      return execute_delete(statement, table);
   }
 
   if (statement->where_ast) {

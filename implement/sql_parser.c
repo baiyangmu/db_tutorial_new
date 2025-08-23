@@ -324,6 +324,34 @@ static int parse_select(Parser* p,ParsedStmt* out){
     return 0;
 }
 
+static int parse_delete(Parser* p, ParsedStmt* out){
+    Lexer* lx = &p->lx;
+    lexer_next(lx);
+
+    if(accept(lx,TOK_FROM)){
+        if(lx->cur.type != TOK_IDENT){
+            return -1;
+        }
+        strncpy(out->table_name,lx->cur.text,PARSED_TABLE_NAME_LEN-1);
+        out->table_name[PARSED_TABLE_NAME_LEN-1] = '\0';
+        lexer_next(lx);
+    } else if(lx->cur.type == TOK_IDENT){
+        strncpy(out->table_name,lx->cur.text,PARSED_TABLE_NAME_LEN-1);
+        out->table_name[PARSED_TABLE_NAME_LEN - 1] = '\0';
+        lexer_next(lx);
+    } else {
+        out->table_name[0] = '\0';
+    }
+
+    if(accept(lx,TOK_WHERE)){
+        out->where = parse_expr(p);
+    } else {
+        out->where = NULL;
+    }
+
+    out->kind = PARSED_DELETE;
+    return 0;
+}
 
 
 void parsed_stmt_free(ParsedStmt* ps){
@@ -356,6 +384,14 @@ int parse_sql_to_parsed_stmt(const char* sql, ParsedStmt* out) {
         int ret = parse_select(&p, out);
         if (ret != 0) return -1;
         out->kind = PARSED_SELECT;
+        return 0;
+    }
+    if(p.lx.cur.type == TOK_DELETE){
+        int ret = parse_delete(&p,out);
+        if(ret != 0){
+            return -1;
+        }
+        out->kind = PARSED_DELETE;
         return 0;
     }
 
