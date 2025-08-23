@@ -31,8 +31,6 @@ The `implement/` directory contains an extended local database engine derived fr
 
 **Current limitations**
 
-- `INSERT` and DDL parsing are simplified. The backend (Flask) can generate simplified SQL that this engine expects (recommended for minimal integration effort).
+- `INSERT` and DDL parsing are simplified.
 - `DELETE` supports only deletion by integer primary key (first column).
 - No transaction/WAL, no concurrency control, and no page reclamation yet.
-
-If you want, I can update this README section with examples showing the minimal SQL forms the engine expects from the Flask backend.
