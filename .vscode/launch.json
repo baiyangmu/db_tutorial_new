@@ -6,7 +6,7 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/implement/mydb",
-            "args": ["test_run.db"],
+            "args": ["deleteDb.db"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],
