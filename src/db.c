@@ -11,6 +11,8 @@
 #include "sql_parser.h"
 #include "sql_ast.h"
 #include <time.h>
+#include <stdarg.h>
+#include "libmydb.h"
 
 typedef struct {
   char* buffer;
@@ -2111,9 +2113,14 @@ static int eval_expr_to_bool(Table* t, const void* row, Expr* e) {
   }
   return 0;
 }
+typedef void (*RowHandler)(Table* t,const void* row,const Statement* st,void* ctx);
 
+static void print_row_handler(Table* t,const void* row,const Statement* st,void* ctx){
+  (void)ctx;
+  print_row_projected(t,row,st->proj_indices,st->proj_count);
+}
 
-ExecuteResult execute_select(Statement* st, Table* table) {
+ExecuteResult execute_select_core(Statement* st, Table* table, RowHandler handler,void* ctx) {
 
   if(st->target_table[0]){
     int idx = catalog_find(table->pager,st->target_table);
@@ -2189,8 +2196,8 @@ ExecuteResult execute_select(Statement* st, Table* table) {
         } else if (st->has_where) {
           pass = row_matches_where(table, row, st);
         }
-        if (pass) {
-          print_row_projected(table, row, st->proj_indices, st->proj_count);
+        if (pass && handler) {
+          handler(table, row, st, ctx);
         }
       }
     }
@@ -2246,28 +2253,44 @@ ExecuteResult execute_select(Statement* st, Table* table) {
   if (start > nrows) start = nrows;
   if (end > nrows) end = nrows;
   for (size_t i = start; i < end; ++i) {
-    print_row_projected(table, rows[i].row, st->proj_indices, st->proj_count);
+    if(handler){
+      handler(table,rows[i].row,st,ctx);
+    }
   }
 
   free(rows);
   return EXECUTE_SUCCESS;
 }
 
+ExecuteResult execute_select(Statement* st, Table* table) {
+	return execute_select_core(st, table, print_row_handler, NULL);
+}
+
+
 ExecuteResult execute_statement(Statement* statement, Table* table) {
+  ExecuteResult result = EXECUTE_SUCCESS;
   switch (statement->type) {
     case (STATEMENT_INSERT):
-      return execute_insert(statement, table);
+      result = execute_insert(statement, table);
+      break;
     case (STATEMENT_SELECT):
-      return execute_select(statement, table);
+      result = execute_select(statement, table);
+      break;
     case (STATEMENT_DELETE):
-      return execute_delete(statement, table);
+      result = execute_delete(statement, table);
+      break;
+    default:
+      result = EXECUTE_SUCCESS;
   }
 
   if (statement->where_ast) {
     expr_free(statement->where_ast);
     statement->where_ast = NULL;
   }
+  return result;
 }
+
+#ifndef BUILDING_MYDB_LIB
 
 int main(int argc, char* argv[]) {
   if (argc < 2) {
@@ -2324,4 +2347,240 @@ int main(int argc, char* argv[]) {
         break;
     }
   }
+}
+
+#endif /* BUILDING_MYDB_LIB */
+
+
+/* lib 库调用方式 */
+
+typedef struct{
+  char* buf;
+  size_t len;
+  size_t cap;
+} StrBuf;
+
+
+static void sb_init(StrBuf* s){
+  s->cap = 1024;
+  s->len = 0;
+  s->buf = malloc(s->cap);
+  if(s->buf){
+    s->buf[0] = '\0';
+  }
+}
+
+
+static void sb_free(StrBuf* s){
+  free(s->buf);
+  s->buf = NULL;
+  s->cap = s->len = 0;
+}
+
+static void sb_ensure(StrBuf* s,size_t need){
+  if(s->len + need + 1 > s->cap){
+    size_t nc = s->cap ? s->cap * 2 : 1024;
+    while(nc < s->len + need + 1){
+      nc *= 2;
+    }
+    s->buf = realloc(s->buf,nc);
+    s->cap = nc;
+  }
+}
+
+
+static void sb_append(StrBuf* s,const char* t){
+  size_t n = strlen(t);
+  sb_ensure(s,n);
+  memcpy(s->buf + s->len, t, n);
+  s->len += n;
+  s->buf[s->len] = '\0';
+}
+
+static void sb_appendf(StrBuf* s,const char*fmt , ...){
+  va_list ap;
+  va_start(ap,fmt);
+  char tmp[512];
+  int n = vsnprintf(tmp,sizeof(tmp),fmt,ap);
+  va_end(ap);
+  if(n<0){
+    return;
+  }
+  if((size_t)n < sizeof(tmp)){
+    sb_append(s,tmp);
+    return;
+  }
+  char* big = malloc(n + 1);
+  va_start(ap,fmt);
+  vsnprintf(big,n+1,fmt,ap);
+  va_end(ap);
+  sb_append(s,big);
+  free(big);
+}
+
+static void json_escape_append(StrBuf* sb, const char* src) {
+  sb_append(sb, "\"");
+  for (const unsigned char* p = (const unsigned char*)src; *p; ++p) {
+    if (*p == '\\' || *p == '"') {
+      sb_appendf(sb, "\\%c", *p);
+    } else if (*p >= 0 && *p < 0x20) {
+      /* control char -> skip or escape as \\u00XX */
+      sb_appendf(sb, "\\u%04x", *p);
+    } else {
+      sb_appendf(sb, "%c", *p);
+    }
+  }
+  sb_append(sb, "\"");
+}
+
+static void append_row_json(StrBuf* sb,Table* t,const void* row){
+  sb_append(sb,"{");
+  for(uint32_t i = 0 ; i < t->active_schema.num_columns; ++i){
+    ColumnDef* c = &t->active_schema.columns[i];
+    if(i){
+      sb_append(sb,",");
+    }
+    sb_appendf(sb, "\"%s\":", c->name);
+    if(c->type == COL_TYPE_INT){
+      int v = row_get_int(t,row,i);
+      sb_appendf(sb,"%d",v);
+    } else if(c->type == COL_TYPE_TIMESTAMP){
+      int64_t tv = row_get_timestamp(t,row,i);
+      sb_appendf(sb,"%lld",(long long)tv);
+    }else{
+      char buf[1024];
+      row_get_string(t,row,i,buf,sizeof(buf));
+      json_escape_append(sb,buf);
+    }
+  }
+  sb_append(sb,"}");
+}
+
+typedef struct {
+	StrBuf* sb;
+	int first;
+} JsonCtx;
+
+
+static void append_row_json_projected(StrBuf* sb,Table* t,const void* row,const int* idxs,uint32_t n){
+  if(n == 0){
+    append_row_json(sb,t,row);
+    return;
+  }
+  sb_append(sb, "{");
+	for (uint32_t i = 0; i < n; ++i) {
+		if (i) sb_append(sb, ",");
+		int col = idxs[i];
+		ColumnDef* c = &t->active_schema.columns[col];
+		sb_appendf(sb, "\"%s\":", c->name);
+		if (c->type == COL_TYPE_INT) {
+			int v = row_get_int(t, row, col);
+			sb_appendf(sb, "%d", v);
+		} else if (c->type == COL_TYPE_TIMESTAMP) {
+			int64_t tv = row_get_timestamp(t, row, col);
+			sb_appendf(sb, "%lld", (long long)tv);
+		} else {
+			char buf[1024];
+			row_get_string(t, row, col, buf, sizeof(buf));
+			json_escape_append(sb, buf);
+		}
+	}
+	sb_append(sb, "}");
+
+}
+
+static void json_row_handler(Table* t,const void* row,const Statement* st,void* ctx){
+  JsonCtx* jc = (JsonCtx*)ctx;
+  if(!jc->first){
+    sb_append(jc->sb,",");
+  }
+  if(st->proj_count == 0){
+    append_row_json(jc->sb,t,row);
+  }else{
+    append_row_json_projected(jc->sb,t,row,st->proj_indices,st->proj_count);
+  }
+  jc->first=0;
+}
+
+
+MYDB_Handle mydb_open(const char* filename){
+  if(!filename){
+    return NULL;
+  }
+  return (MYDB_Handle)db_open(filename);
+}
+
+void mydb_close(MYDB_Handle h){
+  if(!h){
+    return;
+  }
+  db_close((Table*)h);
+}
+
+
+int mydb_execute_json(MYDB_Handle h,const char* sql,char** out_json){
+  if(!out_json){
+    return -1;
+  }
+  *out_json = NULL;
+  if(!h || !sql){
+    return -2;
+  }
+  Table* table = (Table*)h;
+
+  InputBuffer ib;
+  ib.buffer = strdup(sql);
+  ib.buffer_length = strlen(ib.buffer) + 1;
+  ib.input_length = (ssize_t)strlen(ib.buffer);
+
+  Statement st;
+  st.where_ast = NULL;
+  PrepareResult pr = prepare_statement(&ib,&st,table);
+  if(pr == PREPARE_SYNTAX_ERROR){
+    free(ib.buffer);
+    return -3;
+  }
+  if(pr == PREPARE_CREATE_TABLE_DONE){
+    StrBuf sb;
+    sb_init(&sb);
+    sb_append(&sb, "{\"ok\":true,\"message\":\"Executed.\"}");
+    *out_json = sb.buf;
+    free(ib.buffer);
+    return 0;
+  }
+
+  if(pr != PREPARE_SUCCESS){
+    free(ib.buffer);
+    return -4;
+  }
+
+  if (st.type == STATEMENT_INSERT || st.type == STATEMENT_DELETE) {
+    ExecuteResult er = execute_statement(&st, table);
+    StrBuf sb; sb_init(&sb);
+    if (er == EXECUTE_DUPLICATE_KEY) {
+      sb_append(&sb, "{\"ok\":false,\"error\":\"duplicate_key\"}");
+    } else {
+      sb_append(&sb, "{\"ok\":true}");
+    }
+    *out_json = sb.buf;
+    free(ib.buffer);
+    return 0;
+  }
+
+  if (st.type == STATEMENT_SELECT) {
+    StrBuf sb;
+    sb_init(&sb);
+    sb_append(&sb, "{\"ok\":true,\"rows\":[");
+    JsonCtx jctx = {.sb = &sb, .first = 1 };
+
+    execute_select_core(&st,table,json_row_handler,&jctx);
+
+    sb_append(&sb,"]}");
+    *out_json = sb.buf;
+    free(ib.buffer);
+    return 0;
+    
+  }
+  free(ib.buffer);
+  return -5;
 }
