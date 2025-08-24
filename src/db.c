@@ -14,6 +14,19 @@
 #include <stdarg.h>
 #include "libmydb.h"
 
+/* Simple debug logger to file to help trace crashes */
+static void dbg_log(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  FILE* f = fopen("/tmp/mydb_debug.log", "a");
+  if (!f) { va_end(ap); return; }
+  vfprintf(f, fmt, ap);
+  fprintf(f, "\n");
+  fflush(f);
+  fclose(f);
+  va_end(ap);
+}
+
 typedef struct {
   char* buffer;
   size_t buffer_length;
@@ -1321,6 +1334,19 @@ static void collect_values(char* start,Statement* st){
 
 
 PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* st){
+  /* Debug: print incoming parameters for prepare_insert */
+  if (!input_buffer) {
+    fprintf(stderr, "[DEBUG] prepare_insert: input_buffer is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] prepare_insert: input_buffer=%p, buffer='%s'\n", (void*)input_buffer, input_buffer->buffer ? input_buffer->buffer : "(null)");
+  }
+  if (!st) {
+    fprintf(stderr, "[DEBUG] prepare_insert: st is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] prepare_insert: st=%p\n", (void*)st);
+  }
+  fflush(stderr);
+
   st->type = STATEMENT_INSERT;
 
   char* s = input_buffer->buffer;
@@ -1353,8 +1379,24 @@ PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* st){
 
 PrepareResult prepare_statement(InputBuffer* input_buffer,
                                 Statement* statement,Table* table) {
+  /* Debug: print incoming parameters for prepare_statement */
+  if (!input_buffer) {
+    fprintf(stderr, "[DEBUG] prepare_statement: input_buffer is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] prepare_statement: input_buffer=%p, buffer='%s'\n", (void*)input_buffer, input_buffer->buffer ? input_buffer->buffer : "(null)");
+  }
+  if (!statement) {
+    fprintf(stderr, "[DEBUG] prepare_statement: statement is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] prepare_statement: statement=%p\n", (void*)statement);
+  }
+  if (!table) {
+    fprintf(stderr, "[DEBUG] prepare_statement: table is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] prepare_statement: table=%p\n", (void*)table);
+  }
+  fflush(stderr);
 
-  
   const char* s = input_buffer->buffer;
   statement->where_ast = NULL;
   while(*s == ' ' || *s == '\t'){
@@ -2122,6 +2164,27 @@ static void print_row_handler(Table* t,const void* row,const Statement* st,void*
 
 ExecuteResult execute_select_core(Statement* st, Table* table, RowHandler handler,void* ctx) {
 
+  /* Detailed debug logging to trace segfaults */
+  fprintf(stderr, "[DEBUG] execute_select_core: st=%p, table=%p, handler=%p, ctx=%p\n", (void*)st, (void*)table, (void*)handler, ctx);
+  if (st) {
+    fprintf(stderr, "[DEBUG] execute_select_core: st->target_table='%s', proj_count=%u, has_where=%d\n",
+            st->target_table, st->proj_count, st->has_where ? 1 : 0);
+  }
+  if (table) {
+    fprintf(stderr, "[DEBUG] execute_select_core: table=%p, pager=%p, root_page_num=%u, row_size=%u\n",
+            (void*)table, (void*)table->pager, table->root_page_num, table->row_size);
+    if (table->pager) {
+      fprintf(stderr, "[DEBUG] execute_select_core: pager->file_descriptor=%d, file_length=%u, num_pages=%u\n",
+              table->pager->file_descriptor, table->pager->file_length, table->pager->num_pages);
+    }
+    fprintf(stderr, "[DEBUG] execute_select_core: active_schema.name='%s', num_columns=%u\n",
+            table->active_schema.name, table->active_schema.num_columns);
+    for (uint32_t _i = 0; _i < table->active_schema.num_columns && _i < 10; ++_i) {
+      ColumnDef* _c = &table->active_schema.columns[_i];
+      fprintf(stderr, "[DEBUG] execute_select_core: col[%u] name='%s' type=%d size=%u\n", _i, _c->name, (int)_c->type, _c->size);
+    }
+  }
+
   if(st->target_table[0]){
     int idx = catalog_find(table->pager,st->target_table);
     if(idx < 0){
@@ -2396,7 +2459,6 @@ static void sb_append(StrBuf* s,const char* t){
   s->len += n;
   s->buf[s->len] = '\0';
 }
-
 static void sb_appendf(StrBuf* s,const char*fmt , ...){
   va_list ap;
   va_start(ap,fmt);
@@ -2519,6 +2581,20 @@ void mydb_close(MYDB_Handle h){
 
 
 int mydb_execute_json(MYDB_Handle h,const char* sql,char** out_json){
+
+  /* Debug: print incoming parameters */
+  if (h == NULL) {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: handle is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: handle=%p\n", (void*)h);
+  }
+  if (sql == NULL) {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: sql is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: sql='%s'\n", sql);
+  }
+  fflush(stderr);
+
   if(!out_json){
     return -1;
   }
@@ -2534,8 +2610,11 @@ int mydb_execute_json(MYDB_Handle h,const char* sql,char** out_json){
   ib.input_length = (ssize_t)strlen(ib.buffer);
 
   Statement st;
+  memset(&st, 0, sizeof(st));
   st.where_ast = NULL;
   PrepareResult pr = prepare_statement(&ib,&st,table);
+  fprintf(stderr, "[DEBUG] mydb_execute_json: prepared statement, pr=%d, type=%d\n", pr, st.type);
+  fflush(stderr);
   if(pr == PREPARE_SYNTAX_ERROR){
     free(ib.buffer);
     return -3;
@@ -2555,8 +2634,11 @@ int mydb_execute_json(MYDB_Handle h,const char* sql,char** out_json){
   }
 
   if (st.type == STATEMENT_INSERT || st.type == STATEMENT_DELETE) {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: about to execute insert/delete\n"); fflush(stderr);
     ExecuteResult er = execute_statement(&st, table);
-    StrBuf sb; sb_init(&sb);
+    fprintf(stderr, "[DEBUG] mydb_execute_json: execute_statement returned %d\n", er); fflush(stderr);
+    StrBuf sb; 
+    sb_init(&sb);
     if (er == EXECUTE_DUPLICATE_KEY) {
       sb_append(&sb, "{\"ok\":false,\"error\":\"duplicate_key\"}");
     } else {
@@ -2572,8 +2654,9 @@ int mydb_execute_json(MYDB_Handle h,const char* sql,char** out_json){
     sb_init(&sb);
     sb_append(&sb, "{\"ok\":true,\"rows\":[");
     JsonCtx jctx = {.sb = &sb, .first = 1 };
-
+    fprintf(stderr, "[DEBUG] mydb_execute_json: about to execute select_core\n"); fflush(stderr);
     execute_select_core(&st,table,json_row_handler,&jctx);
+    fprintf(stderr, "[DEBUG] mydb_execute_json: returned from select_core\n"); fflush(stderr);
 
     sb_append(&sb,"]}");
     *out_json = sb.buf;

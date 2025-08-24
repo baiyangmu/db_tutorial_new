@@ -1,6 +1,3 @@
-# Makefile for implement/ directory
-# Builds the implementation sources into `mydb` executable
-
 SRCS = db.c sql_lexer.c sql_parser.c
 BIN_DIR = bin
 OBJS = $(patsubst %.c,$(BIN_DIR)/%.o,$(SRCS))
@@ -9,24 +6,47 @@ CC = gcc
 CFLAGS = -std=c11 -Wall -Wextra -g
 TARGET = $(BIN_DIR)/mydb
 
-.PHONY: all run clean format
+LIB_DIR = $(BIN_DIR)
+LIBNAME = mydb
+LIB_SRCS = $(SRCS)
+# PIC objects for building shared/static libs (compile with -fPIC and -DBUILDING_MYDB_LIB)
+LIB_OBJS = $(patsubst %.c,$(BIN_DIR)/pic_%.o,$(LIB_SRCS))
+
+.PHONY: all lib shared static run clean format
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
 
+# normal object rule (for the executable)
+$(BIN_DIR)/%.o: %.c | $(BIN_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# PIC object rule used only by library targets
+PIC_CFLAGS = $(CFLAGS) -fPIC -DBUILDING_MYDB_LIB
+$(BIN_DIR)/pic_%.o: %.c | $(BIN_DIR)
+	$(CC) $(PIC_CFLAGS) -c $< -o $@
+
+# Shared library
+$(LIB_DIR)/lib$(LIBNAME).so: $(LIB_OBJS) | $(LIB_DIR)
+	$(CC) -shared -o $@ $(LIB_OBJS)
+
+# Static archive (using PIC objects is fine)
+$(LIB_DIR)/lib$(LIBNAME).a: $(LIB_OBJS) | $(LIB_DIR)
+	ar rcs $@ $(LIB_OBJS)
+
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
-$(BIN_DIR)/%.o: %.c | $(BIN_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+$(LIB_DIR):
+	mkdir -p $(LIB_DIR)
 
 run: $(TARGET)
 	./$(TARGET) ../mydb.db
 
 clean:
-	rm -f $(TARGET) $(BIN_DIR)/*.o *.db
+	rm -f $(TARGET) $(BIN_DIR)/*.o $(BIN_DIR)/pic_*.o $(LIB_DIR)/* *.db
 
 format:
 	clang-format -style=Google -i *.c
