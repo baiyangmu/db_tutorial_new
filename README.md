@@ -1,3 +1,35 @@
+# 简介：构建一个简单的数据库
+
+本文档是对实现目录（implement/）的简要说明，先给出中文可读版本，随后保留原始英文说明以便参考。
+
+主要特性（中文摘要）
+
+- **多表目录（Catalog）**：持久化的 catalog 位于 page 0，保存表的元数据（schema 与 root page）。一个 DB 文件中可以存在多张表，可以使用 `use <table>` 切换当前表。
+
+- **动态且更大的表结构**：支持最多 100 列，列类型包含 `int`、`string`（定长）和 `timestamp`（8 字节）。行大小在运行时根据 schema 计算。
+
+- **B‑Tree 存储**：实现了内部/叶子节点的 B‑Tree（含插入与分裂逻辑），页被缓存到内存并由 pager 刷写到磁盘。
+
+- **动态行序列化**：`serialize_row_dynamic` 根据当前 schema 将列值序列化；当省略 `timestamp` 列值时默认使用当前 epoch 时间。
+
+- **SQL 解析与 WHERE AST**：基础的词法/解析器会生成 WHERE 子句的 AST（支持比较、`AND/OR/NOT`、`IN`、`BETWEEN`、`IS NULL` 等），查询时用该 AST 进行求值。
+
+- **查询功能**：`SELECT` 支持多列投影、`ORDER BY <col> [ASC|DESC]`、`LIMIT`/`OFFSET`，并在 WHERE 恰好匹配主键相等时走到点查路径以加速查询。
+
+- **删除支持**：实现了按整数主键删除（删除 leaf cell 并在需要时更新 parent key）。注：尚未实现完整的 B‑Tree 重新平衡（合并/重分配）和页回收。
+
+实现取舍
+
+- 实现聚焦于工程需要（记录、查询、删除），而非完整的 SQL 标准；一些特性如 `AUTO_INCREMENT`、`DEFAULT CURRENT_TIMESTAMP`、参数化查询等放在应用层处理或留待后续增强。
+
+当前限制
+
+- `INSERT` 与 DDL 的解析简化处理。
+- `DELETE` 仅支持按第一列（整数主键）删除。
+- 无事务 / WAL、并发控制或页回收机制。
+
+---
+
 # Let's Build a Simple Database
 
 [View rendered tutorial](https://cstack.github.io/db_tutorial/) (with more details on what this is.)
