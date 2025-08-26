@@ -3,7 +3,7 @@ BIN_DIR = bin
 OBJS = $(patsubst %.c,$(BIN_DIR)/%.o,$(SRCS))
 
 CC = gcc
-CFLAGS = -std=c11 -Wall -Wextra -g
+CFLAGS = -std=gnu11 -Wall -Wextra -g
 TARGET = $(BIN_DIR)/mydb
 
 LIB_DIR = $(BIN_DIR)
