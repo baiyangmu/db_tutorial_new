@@ -13,6 +13,9 @@
 #include <time.h>
 #include <stdarg.h>
 #include "libmydb.h"
+/** linux need */
+#include <sys/stat.h>
+
 
 /* Simple debug logger to file to help trace crashes */
 static void dbg_log(const char* fmt, ...) {
