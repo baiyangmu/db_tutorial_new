@@ -3,8 +3,8 @@ BIN_DIR = bin
 OBJS = $(patsubst %.c,$(BIN_DIR)/%.o,$(SRCS))
 
 CC = gcc
-// macos CFLAGS = -std=c11 -Wall -Wextra -g
-// linux
+# macos CFLAGS = -std=c11 -Wall -Wextra -g
+#linux:
 CFLAGS = -std=gnu11 -Wall -Wextra -g
 TARGET = $(BIN_DIR)/mydb
 
