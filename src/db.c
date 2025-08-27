@@ -1737,21 +1737,23 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, char* const* value
   evenly between old (left) and new (right) nodes.
   Starting from the right, move each key to correct position.
   */
-  for (uint32_t i = (uint32_t)leaf_max_cells(cursor->table); i >= 0; i--) {
+  /* Use signed loop variable to avoid unsigned underflow when decrementing to -1 */
+  for (int64_t ii = (int64_t)leaf_max_cells(cursor->table); ii >= 0; --ii) {
+    uint32_t i = (uint32_t)ii; /* safe cast for APIs expecting uint32_t */
     void* destination_node;
-    if (i >= (uint32_t)leaf_left_split_count(cursor->table)) {
+    if (i >= leaf_left_split_count(cursor->table)) {
       destination_node = new_node;
     } else {
       destination_node = old_node;
     }
-    uint32_t index_within_node = (uint32_t)i % leaf_left_split_count(cursor->table);
+    uint32_t index_within_node = i % leaf_left_split_count(cursor->table);
     void* destination = leaf_cell_t(cursor->table, destination_node, index_within_node);
 
-    if (i == cursor->cell_num) {
-      serialize_row_dynamic(cursor->table, values, nvals, 
+    if (i == (uint32_t)cursor->cell_num) {
+      serialize_row_dynamic(cursor->table, values, nvals,
                             leaf_value_t(cursor->table, destination_node, index_within_node));
       *leaf_key_t(cursor->table, destination_node, index_within_node) = key;
-    } else if (i > cursor->cell_num) {
+    } else if (i > (uint32_t)cursor->cell_num) {
       memcpy(destination, leaf_cell_t(cursor->table, old_node, (uint32_t)i - 1), leaf_cell_size(cursor->table));
     } else {
       memcpy(destination, leaf_cell_t(cursor->table, old_node, (uint32_t)i), leaf_cell_size(cursor->table));
