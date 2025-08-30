@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>mydb WASM Minimal Demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 16px; }
+    textarea { width: 100%; box-sizing: border-box; }
+    pre { background:#111; color:#eee; padding:12px; min-height:120px; white-space:pre-wrap; }
+    button { padding:8px 12px; margin-top:8px; }
+  </style>
+</head>
+<body>
+  <h1>mydb WASM Minimal Demo</h1>
+  <label for="sql">SQL:</label>
+  <textarea id="sql" rows="4">select * from images</textarea>
+  <div>
+    <button id="exec" disabled>Execute</button>
+  </div>
+  <h3>Output</h3>
+  <pre id="out">(no output)</pre>
+
+  <script src="../bin/mydb.js"></script>
+  <script>
+    const execBtn = document.getElementById('exec');
+    const sqlEl = document.getElementById('sql');
+    const outEl = document.getElementById('out');
+
+    function ensurePersistent(Module, cb){
+      try{ Module.FS.mkdir('/persistent'); }catch(e){}
+      try{ Module.FS.mount(Module.IDBFS || IDBFS, {}, '/persistent'); }catch(e){}
+      Module.FS.syncfs(true, function(err){ if (err) console.error('FS.syncfs(true) error', err); cb(); });
+    }
+
+    // Use the modularized export `MyDB()` which returns a Promise
+    MyDB().then(Module => {
+      const mydb_open = Module.cwrap('mydb_open_with_ems', 'number', ['string']);
+      const mydb_execute_json = Module.cwrap('mydb_execute_json_with_ems', 'number', ['number','number','number']);
+
+      function allocString(Module, str) {
+        if (Module.allocateUTF8) return Module.allocateUTF8(str);
+        var len = (Module.lengthBytesUTF8 ? Module.lengthBytesUTF8(str) : (new TextEncoder().encode(str).length)) + 1;
+        var ptr = Module._malloc(len);
+        if (!ptr) throw new Error('allocString: malloc failed');
+        if (Module.stringToUTF8) {
+          Module.stringToUTF8(str, ptr, len);
+          return ptr;
+        }
+        if (Module.HEAPU8) {
+          var encoder = new TextEncoder();
+          var bytes = encoder.encode(str);
+          Module.HEAPU8.set(bytes, ptr);
+          Module.HEAPU8[ptr + bytes.length] = 0;
+          return ptr;
+        }
+        Module._free(ptr);
+        throw new Error('allocString: no method to write string into wasm memory');
+      }
+
+      ensurePersistent(Module, () => {
+        const handle = mydb_open('test2.db');
+        if (!handle) {
+          outEl.textContent = 'Failed to open DB handle';
+          return;
+        }
+        execBtn.disabled = false;
+
+        execBtn.addEventListener('click', () => {
+          try {
+            const sql = sqlEl.value;
+            const sqlPtr = allocString(Module, sql);
+            const outPtrPtr = Module._malloc(4);
+            try {
+              const rc = mydb_execute_json(handle, sqlPtr, outPtrPtr);
+              const outPtr = Module.getValue(outPtrPtr, 'i32');
+              let text = null;
+              if (outPtr) {
+                text = Module.UTF8ToString(outPtr);
+                Module._free(outPtr);
+              }
+              outEl.textContent = text || '(null)';
+            } finally {
+              Module._free(outPtrPtr);
+              Module._free(sqlPtr);
+            }
+          } catch (err) {
+            outEl.textContent = 'Error: ' + err;
+          }
+        });
+      });
+    }).catch(err => { outEl.textContent = 'Module load error: ' + err; });
+  </script>
+</body>
+</html>
+
+

@@ -14,7 +14,7 @@ LIB_SRCS = $(SRCS)
 # PIC objects for building shared/static libs (compile with -fPIC and -DBUILDING_MYDB_LIB)
 LIB_OBJS = $(patsubst %.c,$(BIN_DIR)/pic_%.o,$(LIB_SRCS))
 
-.PHONY: all lib shared static run clean format
+.PHONY: all lib shared static run clean format run_wasm
 
 all: $(TARGET)
 
@@ -52,3 +52,19 @@ clean:
 
 format:
 	clang-format -style=Google -i *.c
+
+# Emscripten / WASM build
+EMCC = emcc
+EMFLAGS = -O2 -s WASM=1 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 \
+	-s 'EXPORT_NAME="MyDB"' \
+	-s EXPORTED_FUNCTIONS='["_mydb_open_with_ems","_mydb_close_with_ems","_mydb_execute_json_with_ems","_malloc","_free"]' \
+	-s EXPORTED_RUNTIME_METHODS='["cwrap","ccall","UTF8ToString","stringToUTF8","lengthBytesUTF8","getValue","setValue","FS"]'
+
+$(BIN_DIR)/$(LIBNAME).js: $(SRCS) | $(BIN_DIR)
+	@mkdir -p $(BIN_DIR)
+	$(EMCC) $(CFLAGS) -DBUILDING_MYDB_LIB $(SRCS) -o $@ $(EMFLAGS)
+
+
+run_wasm: $(BIN_DIR)/$(LIBNAME).js
+	@echo "Built WebAssembly module at $(BIN_DIR)/$(LIBNAME).js and .wasm"
+	@echo "Serve the $(BIN_DIR) directory via HTTP (e.g. 'python3 -m http.server --directory $(BIN_DIR) 8000') and use /persistent for IDBFS."

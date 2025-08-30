@@ -524,7 +524,7 @@ const uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
 const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
 const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
-const uint32_t PAGE_SIZE = 4096;
+const uint32_t MYDB_PAGE_SIZE = 4096;
 
 #define INVALID_PAGE_NUM UINT32_MAX
 
@@ -557,7 +557,7 @@ static inline uint32_t leaf_cell_size(Table* t){
 // Forward declare constant defined later in file
 extern const uint32_t LEAF_NODE_HEADER_SIZE;
 static inline int32_t leaf_space_for_cells(void){
-  return PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
+  return MYDB_PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
 }
 
 static inline uint32_t leaf_max_cells(Table* t){
@@ -933,17 +933,17 @@ void* get_page(Pager* pager, uint32_t page_num) {
 
   if (pager->pages[page_num] == NULL) {
     // Cache miss. Allocate memory and load from file.
-    void* page = malloc(PAGE_SIZE);
-    uint32_t num_pages = pager->file_length / PAGE_SIZE;
+    void* page = malloc(MYDB_PAGE_SIZE);
+    uint32_t num_pages = pager->file_length / MYDB_PAGE_SIZE;
 
     // We might save a partial page at the end of the file
-    if (pager->file_length % PAGE_SIZE) {
+    if (pager->file_length % MYDB_PAGE_SIZE) {
       num_pages += 1;
     }
 
     if (page_num <= num_pages) {
-      lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
-      ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
+      lseek(pager->file_descriptor, page_num * MYDB_PAGE_SIZE, SEEK_SET);
+      ssize_t bytes_read = read(pager->file_descriptor, page, MYDB_PAGE_SIZE);
       if (bytes_read == -1) {
         printf("Error reading file: %d\n", errno);
         exit(EXIT_FAILURE);
@@ -2569,6 +2569,50 @@ static void json_row_handler(Table* t,const void* row,const Statement* st,void* 
 }
 
 
+/* Abstract Emscripten helpers: provide real implementations when building
+   for Emscripten, and no-op/stubs otherwise. This keeps the public
+   `mydb_*` functions free of #ifdef clutter. */
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+static int emsfs_mounted = 0;
+static void ems_sync_from_idb(void) {
+  EM_ASM({ FS.syncfs(true, function(err) { if (err) { console.log('FS.syncfs(true) error', err); } }); });
+}
+static void ems_sync_to_idb(void) {
+  EM_ASM({ FS.syncfs(false, function(err) { if (err) { console.log('FS.syncfs(false) error', err); } }); });
+}
+static void ems_fs_init(void) {
+  if (!emsfs_mounted) {
+    EM_ASM({ try { FS.mkdir('/persistent'); } catch(e) {} try { FS.mount(IDBFS, {}, '/persistent'); } catch(e) {} });
+    ems_sync_from_idb();
+    emsfs_mounted = 1;
+  }
+}
+static char* ems_path_for(const char* filename) {
+  size_t need = strlen(filename) + sizeof("/persistent/");
+  char* path = malloc(need);
+  if (!path) return NULL;
+  snprintf(path, need, "/persistent/%s", filename);
+  return path;
+}
+static void ems_persist_flush(Table* table) {
+  if (!table || !table->pager) return;
+  for (uint32_t i = 0; i < table->pager->num_pages; i++) {
+    if (table->pager->pages[i]) {
+      pager_flush(table->pager, i);
+    }
+  }
+}
+#else
+/* Non-Emscripten stubs */
+static void ems_fs_init(void) { }
+static void ems_sync_from_idb(void) { (void)0; }
+static void ems_sync_to_idb(void) { (void)0; }
+static char* ems_path_for(const char* filename) { return strdup(filename); }
+static void ems_persist_flush(Table* table) { (void)table; }
+#endif
+
 MYDB_Handle mydb_open(const char* filename){
   if(!filename){
     return NULL;
@@ -2576,11 +2620,32 @@ MYDB_Handle mydb_open(const char* filename){
   return (MYDB_Handle)db_open(filename);
 }
 
+   MYDB_Handle mydb_open_with_ems(const char* filename) {
+    if(!filename){
+      return NULL;
+    }
+    /* Initialize/mount fs if needed (no-op on native builds) */
+    ems_fs_init();
+    char* pathbuf = ems_path_for(filename);
+    if(!pathbuf) return NULL;
+    Table* t = db_open(pathbuf);
+    free(pathbuf);
+    return (MYDB_Handle)t;
+  }
+
 void mydb_close(MYDB_Handle h){
   if(!h){
     return;
   }
   db_close((Table*)h);
+}
+
+
+void mydb_close_with_ems(MYDB_Handle h) {
+  if (!h) return;
+  db_close((Table*)h);
+  /* Ensure sync to persistent storage when applicable (no-op on native) */
+  ems_sync_to_idb();
 }
 
 
@@ -2649,6 +2714,102 @@ int mydb_execute_json(MYDB_Handle h,const char* sql,char** out_json){
       sb_append(&sb, "{\"ok\":true}");
     }
     *out_json = sb.buf;
+    free(ib.buffer);
+    return 0;
+  }
+
+  if (st.type == STATEMENT_SELECT) {
+    StrBuf sb;
+    sb_init(&sb);
+    sb_append(&sb, "{\"ok\":true,\"rows\":[");
+    JsonCtx jctx = {.sb = &sb, .first = 1 };
+    fprintf(stderr, "[DEBUG] mydb_execute_json: about to execute select_core\n"); fflush(stderr);
+    execute_select_core(&st,table,json_row_handler,&jctx);
+    fprintf(stderr, "[DEBUG] mydb_execute_json: returned from select_core\n"); fflush(stderr);
+
+    sb_append(&sb,"]}");
+    *out_json = sb.buf;
+    free(ib.buffer);
+    return 0;
+    
+  }
+  free(ib.buffer);
+  return -5;
+}
+
+
+int mydb_execute_json_with_ems(MYDB_Handle h, const char* sql, char** out_json) {
+  /* Debug: print incoming parameters */
+  if (h == NULL) {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: handle is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: handle=%p\n", (void*)h);
+  }
+  if (sql == NULL) {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: sql is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: sql='%s'\n", sql);
+  }
+  fflush(stderr);
+
+  if(!out_json){
+    return -1;
+  }
+  *out_json = NULL;
+  if(!h || !sql){
+    return -2;
+  }
+  Table* table = (Table*)h;
+
+  InputBuffer ib;
+  ib.buffer = strdup(sql);
+  ib.buffer_length = strlen(ib.buffer) + 1;
+  ib.input_length = (ssize_t)strlen(ib.buffer);
+
+  Statement st;
+  memset(&st, 0, sizeof(st));
+  st.where_ast = NULL;
+  PrepareResult pr = prepare_statement(&ib,&st,table);
+  fprintf(stderr, "[DEBUG] mydb_execute_json: prepared statement, pr=%d, type=%d\n", pr, st.type);
+  fflush(stderr);
+  if(pr == PREPARE_SYNTAX_ERROR){
+    free(ib.buffer);
+    return -3;
+  }
+  if(pr == PREPARE_CREATE_TABLE_DONE){
+    StrBuf sb;
+    sb_init(&sb);
+    sb_append(&sb, "{\"ok\":true,\"message\":\"Executed.\"}");
+    *out_json = sb.buf;
+    /* Persist changes (Emscripten helper is a no-op on native builds) */
+    ems_persist_flush(table);
+    ems_sync_to_idb();
+    free(ib.buffer);
+    return 0;
+  }
+
+  if(pr != PREPARE_SUCCESS){
+    free(ib.buffer);
+    return -4;
+  }
+
+  if (st.type == STATEMENT_INSERT || st.type == STATEMENT_DELETE) {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: about to execute insert/delete\n"); fflush(stderr);
+    ExecuteResult er = execute_statement(&st, table);
+    fprintf(stderr, "[DEBUG] mydb_execute_json: execute_statement returned %d\n", er); fflush(stderr);
+    StrBuf sb; 
+    sb_init(&sb);
+    if (er == EXECUTE_DUPLICATE_KEY) {
+      sb_append(&sb, "{\"ok\":false,\"error\":\"duplicate_key\"}");
+    } else {
+      sb_append(&sb, "{\"ok\":true}");
+    }
+    *out_json = sb.buf;
+    //使用ems 提供给前端调用
+    if (er != EXECUTE_DUPLICATE_KEY) {
+      ems_persist_flush(table);
+      ems_sync_to_idb();
+    }
     free(ib.buffer);
     return 0;
   }

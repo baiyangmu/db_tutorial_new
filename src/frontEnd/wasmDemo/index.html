@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>MyDB with Emscripten</title>
+</head>
+<body>
+  <h2>MyDB WebAssembly Example</h2>
+  <script src="mydb.js"></script>
+  <script>
+    console.log("typeof MyDB =", typeof MyDB);
+  </script>
+<script>
+  // 命令：
+  /**
+  emcc mydb.c -o mydb.js \   
+  -s MODULARIZE=1 \
+  -s EXPORT_NAME="MyDB" \
+  -s EXPORTED_FUNCTIONS='["_mydb_open","_mydb_close","_mydb_execute_json","_malloc","_free"]' \
+  -s EXPORTED_RUNTIME_METHODS='["cwrap","ccall","UTF8ToString","stringToUTF8","lengthBytesUTF8","getValue","setValue"]'
+   */
+  MyDB().then(Module => {
+    const mydb_open = Module.cwrap("mydb_open", "number", ["string"]);
+    const mydb_close = Module.cwrap("mydb_close", null, ["number"]);
+    const mydb_execute_json = Module.cwrap("mydb_execute_json", "number", ["number","string","number"]);
+
+    const handle = mydb_open("test.db");
+    console.log("Handle:", handle);
+
+    const outPtr = Module._malloc(4);
+    mydb_execute_json(handle, "SELECT * FROM users;", outPtr);
+
+    const resultPtr = Module.getValue(outPtr, "i32");
+    const resultStr = Module.UTF8ToString(resultPtr);
+    console.log("Result JSON:", resultStr);
+
+    Module._free(resultPtr);
+    Module._free(outPtr);
+
+    mydb_close(handle);
+  });
+</script>
+
+</body>
+</html>
+
+
