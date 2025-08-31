@@ -55,7 +55,7 @@ format:
 
 # Emscripten / WASM build
 EMCC = emcc
-EMFLAGS = -O2 -s WASM=1 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 \
+EMFLAGS = -O2 -s WASM=1 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 -sASYNCIFY=1 \
 	-s 'EXPORT_NAME="MyDB"' \
 	-s EXPORTED_FUNCTIONS='["_mydb_open_with_ems","_mydb_close_with_ems","_mydb_execute_json_with_ems","_malloc","_free"]' \
 	-s EXPORTED_RUNTIME_METHODS='["cwrap","ccall","UTF8ToString","stringToUTF8","lengthBytesUTF8","getValue","setValue","FS"]'

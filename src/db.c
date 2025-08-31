@@ -626,7 +626,7 @@ typedef struct {
 
 static void catalog_init(Pager* pager){
    void* page0 = get_page(pager,0);
-   memset(page0,0,PAGE_SIZE);
+   memset(page0,0,MYDB_PAGE_SIZE);
    CatalogHeader* hdr = (CatalogHeader*)page0;
    hdr->magic = DB_MAGIC;
    hdr->version = 1;
@@ -1183,9 +1183,9 @@ Pager* pager_open(const char* filename) {
   Pager* pager = malloc(sizeof(Pager));
   pager->file_descriptor = fd;
   pager->file_length = file_length;
-  pager->num_pages = (file_length / PAGE_SIZE);
+  pager->num_pages = (file_length / MYDB_PAGE_SIZE);
 
-  if (file_length % PAGE_SIZE != 0) {
+  if (file_length % MYDB_PAGE_SIZE != 0) {
     printf("Db file is not a whole number of pages. Corrupt file.\n");
     exit(EXIT_FAILURE);
   }
@@ -1254,7 +1254,7 @@ void pager_flush(Pager* pager, uint32_t page_num) {
     exit(EXIT_FAILURE);
   }
 
-  off_t offset = lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+  off_t offset = lseek(pager->file_descriptor, page_num * MYDB_PAGE_SIZE, SEEK_SET);
 
   if (offset == -1) {
     printf("Error seeking: %d\n", errno);
@@ -1262,7 +1262,7 @@ void pager_flush(Pager* pager, uint32_t page_num) {
   }
 
   ssize_t bytes_written =
-      write(pager->file_descriptor, pager->pages[page_num], PAGE_SIZE);
+      write(pager->file_descriptor, pager->pages[page_num], MYDB_PAGE_SIZE);
 
   if (bytes_written == -1) {
     printf("Error writing: %d\n", errno);
@@ -1547,7 +1547,7 @@ void create_new_root(Table* table, uint32_t right_child_page_num) {
   }
 
   /* Left child has data copied from old root */
-  memcpy(left_child, root, PAGE_SIZE);
+  memcpy(left_child, root, MYDB_PAGE_SIZE);
   set_node_root(left_child, false);
 
   if (get_node_type(left_child) == NODE_INTERNAL) {
