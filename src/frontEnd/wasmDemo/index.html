@@ -11,18 +11,13 @@
     console.log("typeof MyDB =", typeof MyDB);
   </script>
 <script>
-  // 命令：
-  /**
-  emcc mydb.c -o mydb.js \   
-  -s MODULARIZE=1 \
-  -s EXPORT_NAME="MyDB" \
-  -s EXPORTED_FUNCTIONS='["_mydb_open","_mydb_close","_mydb_execute_json","_malloc","_free"]' \
-  -s EXPORTED_RUNTIME_METHODS='["cwrap","ccall","UTF8ToString","stringToUTF8","lengthBytesUTF8","getValue","setValue"]'
-   */
+  
   MyDB().then(Module => {
     const mydb_open = Module.cwrap("mydb_open", "number", ["string"]);
     const mydb_close = Module.cwrap("mydb_close", null, ["number"]);
     const mydb_execute_json = Module.cwrap("mydb_execute_json", "number", ["number","string","number"]);
+    const mydb_read_file = Module.cwrap("mydb_read_file", "number", ["string"]);
+    Module.FS.writeFile("test.txt", "Hello from JS");
 
     const handle = mydb_open("test.db");
     console.log("Handle:", handle);
@@ -34,6 +29,11 @@
     const resultStr = Module.UTF8ToString(resultPtr);
     console.log("Result JSON:", resultStr);
 
+    const ptr = mydb_read_file("test.txt");
+    const content = Module.UTF8ToString(ptr);
+ 
+    console.log("File content:", content);
+    Module._free(ptr);
     Module._free(resultPtr);
     Module._free(outPtr);
 

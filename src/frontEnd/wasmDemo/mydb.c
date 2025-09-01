@@ -47,16 +47,34 @@ int mydb_execute_json(MYDB_Handle h, const char* sql, char** out_json) {
 }
 
 
+char* mydb_read_file(const char* filepath) {
+    FILE* fp = fopen(filepath, "rb");
+    printf("fp is %s",fp);
+    if (!fp) {
+        fprintf(stderr, "Failed to open file: %s\n", filepath);
+        return NULL;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    rewind(fp);
+
+    char* buffer = (char*)malloc(size + 1);
+    if (!buffer) {
+        fprintf(stderr, "Memory allocation failed\n");
+        fclose(fp);
+        return NULL;
+    }
+
+    fread(buffer, 1, size, fp);
+    buffer[size] = '\0';  // 确保是 C 字符串
+
+    fclose(fp);
+    return buffer;
+}
+
 /**
-命令：
+ 命令：
+emcc mydb.c -o mydb.js  -s MODULARIZE=1  -s EXPORT_NAME="MyDB"  -s EXPORTED_FUNCTIONS='["_mydb_open","_mydb_close","_mydb_execute_json","_mydb_read_file","_malloc","_free"]'  -s EXPORTED_RUNTIME_METHODS='["cwrap","ccall","UTF8ToString","stringToUTF8","lengthBytesUTF8","getValue","setValue","FS"]'
 
-
-emcc mydb.c -o mydb.js \
-  -s MODULARIZE=1 \
-  -s EXPORT_NAME="MyDB" \
-  -s EXPORTED_FUNCTIONS='["_mydb_open","_mydb_close","_mydb_execute_json","_malloc","_free"]' \
-  -s EXPORTED_RUNTIME_METHODS='["cwrap","ccall","UTF8ToString","stringToUTF8","lengthBytesUTF8","getValue","setValue"]'
-
-
-  
  */
