@@ -73,6 +73,35 @@ char* mydb_read_file(const char* filepath) {
     return buffer;
 }
 
+int mydb_write_file(const char* filepath, const char* data, size_t data_len) {
+    if (!filepath || !data) {
+        fprintf(stderr, "Invalid arguments to mydb_write_file\n");
+        return -1;
+    }
+
+    FILE* fp = fopen(filepath, "wb");
+    if (!fp) {
+        fprintf(stderr, "Failed to open file for writing: %s\n", filepath);
+        return -1;
+    }
+
+    size_t written = fwrite(data, 1, data_len, fp);
+    if (written != data_len) {
+        fprintf(stderr, "Failed to write full data to file: %s (wrote %zu of %zu)\n", filepath, written, data_len);
+        fclose(fp);
+        return -1;
+    }
+
+    if (fflush(fp) != 0) {
+        fprintf(stderr, "Failed to flush file: %s\n", filepath);
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+    return 0;
+}
+
 /**
  命令：
 emcc mydb.c -o mydb.js  -s MODULARIZE=1  -s EXPORT_NAME="MyDB"  -s EXPORTED_FUNCTIONS='["_mydb_open","_mydb_close","_mydb_execute_json","_mydb_read_file","_malloc","_free"]'  -s EXPORTED_RUNTIME_METHODS='["cwrap","ccall","UTF8ToString","stringToUTF8","lengthBytesUTF8","getValue","setValue","FS"]'

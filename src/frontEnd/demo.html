@@ -27,43 +27,56 @@
     const sqlEl = document.getElementById('sql');
     const outEl = document.getElementById('out');
 
-    function ensurePersistent(Module, cb){
-      try{ Module.FS.mkdir('/persistent'); }catch(e){}
-      try{ Module.FS.mount(Module.IDBFS || IDBFS, {}, '/persistent'); }catch(e){}
-      Module.FS.syncfs(true, function(err){ if (err) console.error('FS.syncfs(true) error', err); cb(); });
+    function ensurePersistent(Module) {
+      return new Promise((resolve, reject) => {
+        try { Module.FS.mkdir('/persistent'); } catch (e) {}
+        try { Module.FS.mount(Module.IDBFS || IDBFS, {}, '/persistent'); } catch (e) {
+          console.warn('mount IDBFS failed (may be already mounted)', e);
+        }
+        Module.FS.syncfs(true, function(err) {
+          if (err) {
+            console.error('FS.syncfs(true) error', err);
+            reject(err);
+          } else {
+            console.log('IDBFS -> MEMFS sync complete');
+            resolve();
+          }
+        });
+      });
+    }
+
+    function allocString(Module, str) {
+      if (Module.allocateUTF8) return Module.allocateUTF8(str);
+      var len = (Module.lengthBytesUTF8 ? Module.lengthBytesUTF8(str) : (new TextEncoder().encode(str).length)) + 1;
+      var ptr = Module._malloc(len);
+      if (!ptr) throw new Error('allocString: malloc failed');
+      if (Module.stringToUTF8) {
+        Module.stringToUTF8(str, ptr, len);
+        return ptr;
+      }
+      if (Module.HEAPU8) {
+        var encoder = new TextEncoder();
+        var bytes = encoder.encode(str);
+        Module.HEAPU8.set(bytes, ptr);
+        Module.HEAPU8[ptr + bytes.length] = 0;
+        return ptr;
+      }
+      Module._free(ptr);
+      throw new Error('allocString: no method to write string into wasm memory');
     }
 
     // Use the modularized export `MyDB()` which returns a Promise
     MyDB().then(Module => {
-      const mydb_open = Module.cwrap('mydb_open_with_ems', 'number', ['string']);
-      const mydb_execute_json = Module.cwrap('mydb_execute_json_with_ems', 'number', ['number','number','number']);
+      ensurePersistent(Module).then(() => {
+        const mydb_open = Module.cwrap('mydb_open_with_ems', 'number', ['string']);
+        const mydb_execute_json = Module.cwrap('mydb_execute_json_with_ems', 'number', ['number','number','number']);
 
-      function allocString(Module, str) {
-        if (Module.allocateUTF8) return Module.allocateUTF8(str);
-        var len = (Module.lengthBytesUTF8 ? Module.lengthBytesUTF8(str) : (new TextEncoder().encode(str).length)) + 1;
-        var ptr = Module._malloc(len);
-        if (!ptr) throw new Error('allocString: malloc failed');
-        if (Module.stringToUTF8) {
-          Module.stringToUTF8(str, ptr, len);
-          return ptr;
-        }
-        if (Module.HEAPU8) {
-          var encoder = new TextEncoder();
-          var bytes = encoder.encode(str);
-          Module.HEAPU8.set(bytes, ptr);
-          Module.HEAPU8[ptr + bytes.length] = 0;
-          return ptr;
-        }
-        Module._free(ptr);
-        throw new Error('allocString: no method to write string into wasm memory');
-      }
-
-      ensurePersistent(Module, () => {
         const handle = mydb_open('test2.db');
         if (!handle) {
           outEl.textContent = 'Failed to open DB handle';
           return;
         }
+
         execBtn.disabled = false;
 
         execBtn.addEventListener('click', () => {
@@ -84,10 +97,24 @@
               Module._free(outPtrPtr);
               Module._free(sqlPtr);
             }
+
+            // Persist any changes under /persistent to IndexedDB
+            try {
+              Module.FS.syncfs(false, function(err) {
+                if (err) console.error('Failed to persist DB to IDBFS:', err);
+                else console.log('Persisted /persistent -> IDBFS');
+              });
+            } catch (e) {
+              console.error('DB persist error:', e);
+            }
+
           } catch (err) {
             outEl.textContent = 'Error: ' + err;
           }
         });
+      }).catch(err => {
+        console.error('Failed to initialize persistent FS', err);
+        outEl.textContent = 'Module init error: ' + err;
       });
     }).catch(err => { outEl.textContent = 'Module load error: ' + err; });
   </script>
@@ -95,3 +122,12 @@
 </html>
 
 
+/**
+emcc db.c sql_lexer.c sql_parser.c -o /Users/baiyangmu333/Projects/db_learn/db_tutorial-master/src/bin/mydb.js \
+  -s MODULARIZE=1 \
+  -s EXPORT_NAME="MyDB" \
+  -s EXPORTED_FUNCTIONS='["_mydb_open_with_ems","_mydb_close_with_ems","_mydb_execute_json_with_ems","_mydb_open","_mydb_close","_mydb_execute_json","_malloc","_free"]' \
+  -s EXPORTED_RUNTIME_METHODS='["cwrap","ccall","UTF8ToString","stringToUTF8","lengthBytesUTF8","getValue","setValue","FS","IDBFS","allocateUTF8"]' \
+  -lidbfs.js \
+  -sFORCE_FILESYSTEM
+*/

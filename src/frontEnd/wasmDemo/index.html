@@ -13,31 +13,67 @@
 <script>
   
   MyDB().then(Module => {
-    const mydb_open = Module.cwrap("mydb_open", "number", ["string"]);
-    const mydb_close = Module.cwrap("mydb_close", null, ["number"]);
-    const mydb_execute_json = Module.cwrap("mydb_execute_json", "number", ["number","string","number"]);
-    const mydb_read_file = Module.cwrap("mydb_read_file", "number", ["string"]);
-    Module.FS.writeFile("test.txt", "Hello from JS");
+    // Mount IDBFS at /persistent and load persisted files into MEMFS
+    try {
+      if (!Module.FS.analyzePath('/persistent').exists) {
+        Module.FS.mkdir('/persistent');
+      }
+    } catch (e) {
+      // ignore if mkdir fails because it already exists
+    }
 
-    const handle = mydb_open("test.db");
-    console.log("Handle:", handle);
+    try {
+      Module.FS.mount(Module.IDBFS, {}, '/persistent');  
+    } catch (e) {
+      console.error('Failed to mount IDBFS:', e);
+    }
 
-    const outPtr = Module._malloc(4);
-    mydb_execute_json(handle, "SELECT * FROM users;", outPtr);
+    Module.FS.syncfs(true, function(err) {
+      if (err) {
+        console.error('Failed to sync from IDBFS:', err);
+      } else {
+        console.log('Loaded files from IDBFS into /persistent');
+      }
 
-    const resultPtr = Module.getValue(outPtr, "i32");
-    const resultStr = Module.UTF8ToString(resultPtr);
-    console.log("Result JSON:", resultStr);
+      // Application logic runs after sync so persisted files are available
+      function runApp() {
+        const mydb_open = Module.cwrap("mydb_open", "number", ["string"]);
+        const mydb_close = Module.cwrap("mydb_close", null, ["number"]);
+        const mydb_execute_json = Module.cwrap("mydb_execute_json", "number", ["number","string","number"]);
+        const mydb_read_file = Module.cwrap("mydb_read_file", "number", ["string"]);
 
-    const ptr = mydb_read_file("test.txt");
-    const content = Module.UTF8ToString(ptr);
- 
-    console.log("File content:", content);
-    Module._free(ptr);
-    Module._free(resultPtr);
-    Module._free(outPtr);
+        // Write into the persistent directory and then persist to IDB
+        const persistentPath = '/persistent/test.txt';
+        Module.FS.writeFile(persistentPath, 'Hello from JS');
+        Module.FS.syncfs(false, function(err) {
+          if (err) console.error('Failed to persist to IDBFS:', err);
+          else console.log('Persisted /persistent to IDBFS');
+        });
 
-    mydb_close(handle);
+        const handle = mydb_open("test.db");
+        console.log("Handle:", handle);
+
+        const outPtr = Module._malloc(4);
+        mydb_execute_json(handle, "SELECT * FROM users;", outPtr);
+
+        const resultPtr = Module.getValue(outPtr, "i32");
+        const resultStr = Module.UTF8ToString(resultPtr);
+        console.log("Result JSON:", resultStr);
+
+        // Read the file from the persistent path
+        const ptr = mydb_read_file(persistentPath);
+        const content = Module.UTF8ToString(ptr);
+
+        console.log("File content:", content);
+        Module._free(ptr);
+        Module._free(resultPtr);
+        Module._free(outPtr);
+
+        mydb_close(handle);
+      }
+
+      runApp();
+    });
   });
 </script>
 
