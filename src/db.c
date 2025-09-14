@@ -15,7 +15,7 @@
 #include "libmydb.h"
 /** linux need */
 #include <sys/stat.h>
-
+static const char* EMS_DEFAULT_PERSIST_PATH = "/persistent/schemas.json";
 
 /* Simple debug logger to file to help trace crashes */
 static void dbg_log(const char* fmt, ...) {
@@ -100,6 +100,7 @@ typedef struct {
   uint32_t file_length;
   uint32_t num_pages;
   void* pages[TABLE_MAX_PAGES];
+  char* filename;
 } Pager;
 
 
@@ -595,6 +596,7 @@ void* get_page(Pager* pager, uint32_t page_num);
 void initialize_leaf_node(void* node);
 void set_node_root(void* node, bool is_root);
 uint32_t get_unused_page_num(Pager* pager);
+void pager_flush(Pager* pager, uint32_t page_num);
 static void serialize_row_dynamic(Table* t, char* const* values, uint32_t n, void* dest);
 static void print_row_dynamic(Table* t, const void* src);
 // lookup helper used by prepare_select; implemented after catalog types
@@ -609,8 +611,18 @@ int lookup_table_schema(Pager* pager, const char* name, TableSchema* out_schema)
 
 typedef struct {
   uint32_t magic;
-  uint32_t version;      // 初始 1
+  uint32_t version;      // 初始 1, >=2 表示内嵌 schema blob 支持
   uint32_t num_tables;
+  /* schema blob pointer info (page-relative)
+     - schemas_start_page: starting page of serialized schemas (INVALID_PAGE_NUM if none)
+     - schemas_alloc_pages: number of pages allocated for the blob
+     - schemas_byte_len: actual serialized byte length
+     - schemas_checksum: optional checksum (simple adler32/whatever)
+  */
+  uint32_t schemas_start_page;
+  uint32_t schemas_alloc_pages;
+  uint32_t schemas_byte_len;
+  uint32_t schemas_checksum;
 } CatalogHeader;
 
 
@@ -620,7 +632,7 @@ typedef struct {
 typedef struct {
   char name[MAX_TABLE_NAME_LEN];  // 32
   uint32_t root_page_num;
-  TableSchema schema;             // 现有结构，可先保留
+  uint32_t schema_index; 
 } CatalogEntry;
 
 
@@ -629,8 +641,12 @@ static void catalog_init(Pager* pager){
    memset(page0,0,MYDB_PAGE_SIZE);
    CatalogHeader* hdr = (CatalogHeader*)page0;
    hdr->magic = DB_MAGIC;
-   hdr->version = 1;
+   hdr->version = 2; /* default to v2 so new DBs have embedded schema support */
    hdr->num_tables = 0;
+   hdr->schemas_start_page = INVALID_PAGE_NUM;
+   hdr->schemas_alloc_pages = 0;
+   hdr->schemas_byte_len = 0;
+   hdr->schemas_checksum = 0;
 }
 
 static CatalogHeader* catalog_header(Pager* pager){
@@ -642,6 +658,14 @@ static CatalogEntry* catalog_entries(Pager* pager){
   return (CatalogEntry*)((uint8_t*)get_page(pager,0) + sizeof(CatalogHeader));
 }
 
+/* forward declarations / externs for schema storage used below */
+extern TableSchema g_table_schemas[];
+extern uint32_t g_num_tables;
+void load_schemas_for_db(const char* dbfile);
+int save_schemas_for_db(const char* dbfile);
+int schema_store_save_str(const char* serialized, const char* dbfile);
+char* schema_store_load_str(const char* dbfile);
+void parse_schemas_from_str(char* loaded);
 
 static int catalog_find(Pager* pager, const char* name){
   CatalogHeader* hdr = catalog_header(pager);
@@ -661,7 +685,12 @@ int lookup_table_schema(Pager* pager, const char* name, TableSchema* out_schema)
     return -1;
   }
   CatalogEntry* ents = catalog_entries(pager);
-  *out_schema = ents[idx].schema;
+  uint32_t sidx = ents[idx].schema_index;
+  if (sidx >= g_num_tables) {
+    fprintf(stderr, "[LOOKUP_SCHEMA] invalid schema_index=%u (g_num_tables=%u)\n", sidx, g_num_tables);
+    return -1;
+  }
+  *out_schema = g_table_schemas[sidx];
   return 0;
 }
 
@@ -676,7 +705,7 @@ static int catalog_add_table(Pager* pager, const TableSchema* schema,uint32_t ro
   memset(e,0,sizeof(*e));
   strncpy(e->name,schema->name,MAX_TABLE_NAME_LEN - 1);
   e->root_page_num = root_page_num;
-  e->schema = *schema;
+  e->schema_index = 0; /* will be set by caller after adding to g_table_schemas */
   hdr->num_tables++;
   return 0;
 }
@@ -766,11 +795,34 @@ int handle_create_table_ex(Table* runtime_table, const char* sql) {
   set_node_root(root_node, true);
 
   // persist into catalog
+  /* store schema in global schema table and reference by index from catalog */
+  if (g_num_tables >= MAX_TABLES) {
+    fprintf(stderr, "[CREATE_TABLE] too many global schemas: %u\n", g_num_tables); fflush(stderr);
+    return -5;
+  }
+  g_table_schemas[g_num_tables] = schema;
+  uint32_t schema_idx = g_num_tables;
+  g_num_tables++;
+
   if (catalog_add_table(runtime_table->pager, &schema, root) != 0) {
       return -5;
   }
+  /* update the newly added catalog entry's schema_index */
+  CatalogHeader* hdr = catalog_header(runtime_table->pager);
+  CatalogEntry* ents = catalog_entries(runtime_table->pager);
+  if (hdr && hdr->num_tables > 0) {
+    uint32_t last = hdr->num_tables - 1;
+    ents[last].schema_index = schema_idx;
+  }
 
   printf("Table '%s' created with %d columns.\n", schema.name, schema.num_columns);
+  /* Persist schemas immediately so CREATE TABLE is durable */
+  if (runtime_table && runtime_table->pager && runtime_table->pager->filename) {
+    int sres = save_schemas_for_db(runtime_table->pager->filename);
+    if (sres != 0) {
+      fprintf(stderr, "[CREATE_TABLE] failed to persist schemas: %d\n", sres);
+    }
+  }
   return 0;
 }
 
@@ -1184,6 +1236,7 @@ Pager* pager_open(const char* filename) {
   pager->file_descriptor = fd;
   pager->file_length = file_length;
   pager->num_pages = (file_length / MYDB_PAGE_SIZE);
+  pager->filename = strdup(filename);
 
   if (file_length % MYDB_PAGE_SIZE != 0) {
     printf("Db file is not a whole number of pages. Corrupt file.\n");
@@ -1196,6 +1249,99 @@ Pager* pager_open(const char* filename) {
 
   return pager;
 }
+
+
+/* Helper: parse serialized schemas string into g_table_schemas */
+void parse_schemas_from_str(char* loaded) {
+  if (!loaded) return;
+  char* p = loaded;
+  unsigned int count = 0;
+  if (sscanf(p, "%u", &count) == 1) {
+    char* nl = strchr(p, '\n'); if (nl) p = nl + 1; else p = NULL;
+  }
+  if (!p) return;
+  g_num_tables = 0;
+  for (unsigned int i = 0; i < MAX_TABLES && p && *p; ++i) {
+    char line[1024];
+    char* nl = strchr(p, '\n'); if (!nl) break;
+    size_t len = nl - p; if (len >= sizeof(line)) len = sizeof(line) - 1;
+    memcpy(line, p, len); line[len] = '\0'; p = nl + 1;
+    strncpy(g_table_schemas[i].name, line, MAX_TABLE_NAME_LEN - 1);
+
+    nl = strchr(p, '\n'); if (!nl) break;
+    len = nl - p; if (len >= sizeof(line)) len = sizeof(line) - 1;
+    memcpy(line, p, len); line[len] = '\0'; p = nl + 1;
+    unsigned int num_cols = (unsigned int)atoi(line);
+    if (num_cols > MAX_COLUMNS) num_cols = MAX_COLUMNS;
+    g_table_schemas[i].num_columns = num_cols;
+
+    for (unsigned int j = 0; j < num_cols; ++j) {
+      nl = strchr(p, '\n'); if (!nl) break;
+      len = nl - p; if (len >= sizeof(line)) len = sizeof(line) - 1;
+      memcpy(line, p, len); line[len] = '\0'; p = nl + 1;
+      char colname[MAX_COLUMN_NAME_LEN]; unsigned int t=0, sz=0;
+      sscanf(line, "%[^	]\t%u\t%u", colname, &t, &sz);
+      strncpy(g_table_schemas[i].columns[j].name, colname, MAX_COLUMN_NAME_LEN - 1);
+      g_table_schemas[i].columns[j].type = (ColumType)t;
+      g_table_schemas[i].columns[j].size = (uint32_t)sz;
+    }
+    g_num_tables++;
+  }
+}
+
+
+
+/* Load schemas for native (sidecar) or ems (default) */
+void load_schemas_for_db(const char* dbfile) {
+  char* loaded = NULL;
+#ifdef __EMSCRIPTEN__
+  /* On Emscripten, use a single global persistent file */
+  loaded = schema_store_load_str(NULL);
+#else
+  /* Prefer embedded schemas in DB (page0 -> hdr fields). If not present, fall back to sidecar file. */
+  if (dbfile) {
+    Pager* tmp_pager = pager_open(dbfile);
+    if (tmp_pager) {
+      CatalogHeader* hdr = (CatalogHeader*)get_page(tmp_pager, 0);
+      if (hdr && hdr->version >= 2 && hdr->schemas_start_page != INVALID_PAGE_NUM && hdr->schemas_byte_len > 0) {
+        /* read blob from pages */
+        uint32_t start = hdr->schemas_start_page;
+        uint32_t bytes = hdr->schemas_byte_len;
+        uint32_t pages = (bytes + MYDB_PAGE_SIZE - 1) / MYDB_PAGE_SIZE;
+        char* buf = malloc(bytes + 1);
+        if (buf) {
+          uint32_t have = 0;
+          for (uint32_t i = 0; i < pages; ++i) {
+            void* p = get_page(tmp_pager, start + i);
+            uint32_t want = (bytes - have) > MYDB_PAGE_SIZE ? MYDB_PAGE_SIZE : (bytes - have);
+            memcpy(buf + have, p, want);
+            have += want;
+          }
+          buf[bytes] = '\0';
+          loaded = buf;
+        }
+      }
+      /* close pager but don't free its inner pages (pager_open returns allocated Pager) */
+      close(tmp_pager->file_descriptor);
+      if (tmp_pager->filename) free(tmp_pager->filename);
+      free(tmp_pager);
+    }
+    if (!loaded) {
+      size_t n = strlen(dbfile) + 9;
+      char* side = malloc(n);
+      if (side) {
+        snprintf(side, n, "%s.schemas", dbfile);
+        loaded = schema_store_load_str(side);
+        free(side);
+      }
+    }
+  }
+#endif
+  if (!loaded) return;
+  parse_schemas_from_str(loaded);
+  free(loaded);
+}
+
 
 Table* db_open(const char* filename) {
   Pager* pager = pager_open(filename);
@@ -1215,8 +1361,106 @@ Table* db_open(const char* filename) {
   table->pager = pager;
   table->root_page_num = INVALID_PAGE_NUM;
 
+  /* Attempt to load persisted schemas for this DB (native sidecar or ems path) */
+  if (pager && pager->filename) {
+    load_schemas_for_db(pager->filename);
+  }
+
   return table;
 }
+
+
+/* Helper: serialize g_table_schemas into malloc'd string (caller frees) */
+static char* serialize_schemas(void) {
+  size_t cap = 4096;
+  char* buf = malloc(cap);
+  if (!buf) return NULL;
+  size_t off = 0;
+  off += snprintf(buf + off, cap - off, "%u\n", (unsigned int)g_num_tables);
+  for (uint32_t i = 0; i < g_num_tables && i < MAX_TABLES; ++i) {
+    TableSchema* sc = &g_table_schemas[i];
+    off += snprintf(buf + off, cap - off, "%s\n", sc->name);
+    off += snprintf(buf + off, cap - off, "%u\n", (unsigned int)sc->num_columns);
+    for (uint32_t j = 0; j < sc->num_columns; ++j) {
+      ColumnDef* c = &sc->columns[j];
+      off += snprintf(buf + off, cap - off, "%s\t%u\t%u\n", c->name, (unsigned int)c->type, (unsigned int)c->size);
+      if (off + 256 > cap) {
+        cap *= 2;
+        char* nb = realloc(buf, cap);
+        if (!nb) { free(buf); return NULL; }
+        buf = nb;
+      }
+    }
+  }
+  return buf;
+}
+
+
+
+/* Save schemas for native (sidecar) or ems (default) */
+int save_schemas_for_db(const char* dbfile) {
+  char* s = serialize_schemas();
+  if (!s) return -1;
+  int rc = -1;
+  if (dbfile) {
+    /* Write serialized schemas into the .db file pages and update header */
+    Pager* pager = pager_open(dbfile);
+    if (!pager) { free(s); return -1; }
+    CatalogHeader* hdr = (CatalogHeader*)get_page(pager, 0);
+    uint32_t old_start = hdr->schemas_start_page;
+    uint32_t old_alloc = hdr->schemas_alloc_pages;
+    uint32_t bytes = (uint32_t)strlen(s);
+    uint32_t needed = (bytes + MYDB_PAGE_SIZE - 1) / MYDB_PAGE_SIZE;
+    uint32_t start = INVALID_PAGE_NUM;
+    if (old_start != INVALID_PAGE_NUM && needed <= old_alloc) {
+      start = old_start; /* overwrite in-place */
+    } else {
+      start = get_unused_page_num(pager); /* append */
+    }
+    for (uint32_t i = 0; i < needed; ++i) {
+      void* p = get_page(pager, start + i);
+      uint32_t off = i * MYDB_PAGE_SIZE;
+      uint32_t to_copy = (bytes > off) ? (uint32_t)((bytes - off) < MYDB_PAGE_SIZE ? (bytes - off) : MYDB_PAGE_SIZE) : 0;
+      /* zero page to avoid leaking previous contents */
+      memset(p, 0, MYDB_PAGE_SIZE);
+      if (to_copy) memcpy(p, s + off, to_copy);
+      pager_flush(pager, start + i);
+    }
+    hdr->schemas_start_page = start;
+    hdr->schemas_alloc_pages = needed;
+    hdr->schemas_byte_len = bytes;
+    hdr->schemas_checksum = 0;
+    hdr->version = 2;
+    pager_flush(pager, 0);
+    /* close pager and free pages allocated in memory */
+    for (uint32_t i = 0; i < pager->num_pages; ++i) {
+      if (pager->pages[i]) { free(pager->pages[i]); pager->pages[i] = NULL; }
+    }
+    int res = close(pager->file_descriptor);
+    (void)res;
+    if (pager->filename) free(pager->filename);
+    free(pager);
+    rc = 0;
+  } else {
+    rc = schema_store_save_str(s, NULL);
+  }
+  free(s);
+  return rc;
+}
+
+
+int schema_store_save_str(const char* serialized, const char* dbfile) {
+  if (!dbfile) {
+      // native 模式必须指定文件名
+      return -1;
+  }
+  FILE* f = fopen(dbfile, "w");
+  if (!f) return -1;
+  fwrite(serialized, 1, strlen(serialized), f);
+  fclose(f);
+  return 0;
+}
+
 
 InputBuffer* new_input_buffer() {
   InputBuffer* input_buffer = malloc(sizeof(InputBuffer));
@@ -1293,6 +1537,11 @@ void db_close(Table* table) {
       free(page);
       pager->pages[i] = NULL;
     }
+  }
+  /* Persist schemas for native sidecar if filename is available */
+  if (pager->filename) {
+    save_schemas_for_db(pager->filename);
+    free(pager->filename);
   }
   free(pager);
   free(table);
@@ -1415,7 +1664,14 @@ PrepareResult prepare_statement(InputBuffer* input_buffer,
     CatalogEntry* ents = catalog_entries(table->pager);
     table->root_page_num = ents[idx].root_page_num;
     
-    table->active_schema = ents[idx].schema;
+    /* get schema from global schema table by schema_index */
+    uint32_t sidx = ents[idx].schema_index;
+    if (sidx < g_num_tables) {
+      table->active_schema = g_table_schemas[sidx];
+    } else {
+      /* fallback: empty schema */
+      memset(&table->active_schema, 0, sizeof(TableSchema));
+    }
     table->row_size = compute_row_size(&table->active_schema);
 
     printf("Using table '%s'.\n",ents[idx].name);
@@ -1852,7 +2108,13 @@ ExecuteResult execute_insert(Statement* st, Table* table) {
     if (idx < 0) { printf("Table not found: %s\n", st->target_table); return EXECUTE_SUCCESS; }
     CatalogEntry* ents = catalog_entries(table->pager);
     table->root_page_num = ents[idx].root_page_num;
-    table->active_schema = ents[idx].schema;
+    /* get schema from global schema table by schema_index */
+    uint32_t sidx = ents[idx].schema_index;
+    if (sidx < g_num_tables) {
+      table->active_schema = g_table_schemas[sidx];
+    } else {
+      memset(&table->active_schema, 0, sizeof(TableSchema));
+    }
     table->row_size = compute_row_size(&table->active_schema);
   }
 
@@ -1893,8 +2155,13 @@ ExecuteResult execute_delete(Statement* st,Table* table){
     }
     CatalogEntry* ents = catalog_entries(table->pager);
     table->root_page_num = ents[idx].root_page_num;
-    table->active_schema = ents[idx].schema;
-    table->row_size = compute_row_size(&table->active_schema);    
+    uint32_t sidx = ents[idx].schema_index;
+    if (sidx < g_num_tables) {
+      table->active_schema = g_table_schemas[sidx];
+    } else {
+      memset(&table->active_schema, 0, sizeof(TableSchema));
+    }
+    table->row_size = compute_row_size(&table->active_schema);
   }
 
   if(table->root_page_num == INVALID_PAGE_NUM){
@@ -2197,7 +2464,12 @@ ExecuteResult execute_select_core(Statement* st, Table* table, RowHandler handle
     }
     CatalogEntry* ents = catalog_entries(table->pager);
     table->root_page_num = ents[idx].root_page_num;
-    table->active_schema = ents[idx].schema;
+    uint32_t sidx = ents[idx].schema_index;
+    if (sidx < g_num_tables) {
+      table->active_schema = g_table_schemas[sidx];
+    } else {
+      memset(&table->active_schema, 0, sizeof(TableSchema));
+    }
     table->row_size = compute_row_size(&table->active_schema);
   }
 
@@ -2569,6 +2841,30 @@ static void json_row_handler(Table* t,const void* row,const Statement* st,void* 
 }
 
 
+char* schema_store_load_str(const char* dbfile) {
+  const char* path = dbfile;
+#ifdef __EMSCRIPTEN__
+  if (!path) path = EMS_DEFAULT_PERSIST_PATH;
+#else
+  if (!path) return NULL; /* native requires explicit dbfile */
+#endif
+  FILE* f = fopen(path, "r");
+  if (!f) return NULL;
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f);
+  rewind(f);
+  if (size <= 0) { fclose(f); return NULL; }
+  char* buf = (char*)malloc((size_t)size + 1);
+  if (!buf) { fclose(f); return NULL; }
+  fread(buf, 1, size, f);
+  buf[size] = '\0';
+  fclose(f);
+  return buf;
+}
+
+
+
+
 /* Abstract Emscripten helpers: provide real implementations when building
    for Emscripten, and no-op/stubs otherwise. This keeps the public
    `mydb_*` functions free of #ifdef clutter. */
@@ -2579,13 +2875,109 @@ static int emsfs_mounted = 0;
 static void ems_sync_from_idb(void) {
   EM_ASM({ FS.syncfs(true, function(err) { if (err) { console.log('FS.syncfs(true) error', err); } }); });
 }
-static void ems_sync_to_idb(void) {
-  EM_ASM({ FS.syncfs(false, function(err) { if (err) { console.log('FS.syncfs(false) error', err); } }); });
+
+
+int schema_store_save_str_ems(const char* serialized, const char* dbfile) {
+  const char* path = dbfile ? dbfile : EMS_DEFAULT_PERSIST_PATH;
+  fprintf(stderr, "[SCHEMA_SAVE] path=%s, len=%zu\n", path, strlen(serialized)); fflush(stderr);
+
+  FILE* f = fopen(path, "w");
+  if (!f) return -1;
+
+  fwrite(serialized, 1, strlen(serialized), f);
+  fclose(f);
+  fprintf(stderr, "[SCHEMA_SAVE] written %zu bytes to %s\n", strlen(serialized), path); fflush(stderr);
+
+  // 持久化到 IndexedDB
+  EM_ASM({ 
+      FS.syncfs(false, function(err) { 
+          if (err) console.log('FS.syncfs error', err); 
+      }); 
+  });
+
+  return 0;
 }
+
+// Save g_table_schemas to /persistent/schemas.json and sync to IDB
+static void ems_save_schemas(void) {
+  size_t cap = 4096;
+  char* buf = malloc(cap);
+  if (!buf) return;
+  size_t off = 0;
+  off += snprintf(buf + off, cap - off, "%u\n", (unsigned int)g_num_tables);
+  for (uint32_t i = 0; i < g_num_tables && i < MAX_TABLES; ++i) {
+    TableSchema* sc = &g_table_schemas[i];
+    off += snprintf(buf + off, cap - off, "%s\n", sc->name);
+    off += snprintf(buf + off, cap - off, "%u\n", (unsigned int)sc->num_columns);
+    for (uint32_t j = 0; j < sc->num_columns; ++j) {
+      ColumnDef* c = &sc->columns[j];
+      off += snprintf(buf + off, cap - off, "%s\t%u\t%u\n", c->name, (unsigned int)c->type, (unsigned int)c->size);
+      if (off + 256 > cap) {
+        cap *= 2;
+        char* nb = realloc(buf, cap);
+        if (!nb) break;
+        buf = nb;
+      }
+    }
+  }
+  fprintf(stderr, "[EMS_SAVE_SCHEMAS] serializing %zu bytes\n", off); fflush(stderr);
+  schema_store_save_str_ems(buf, NULL);
+  fprintf(stderr, "[EMS_SAVE_SCHEMAS] schema_store_save_str_ems returned\n"); fflush(stderr);
+  free(buf);
+}
+
+// Load g_table_schemas from /persistent/schemas.json if present
+static void ems_load_schemas(void) {
+  char* loaded = schema_store_load_str(NULL);
+  if (!loaded) return;
+  char* p = loaded;
+  unsigned int count = 0;
+  if (sscanf(p, "%u", &count) == 1) {
+    char* nl = strchr(p, '\n'); if (nl) p = nl + 1; else p = NULL;
+  }
+  if (!p) { free(loaded); return; }
+  g_num_tables = 0;
+  for (unsigned int i = 0; i < MAX_TABLES && p && *p; ++i) {
+    char line[1024];
+    char* nl = strchr(p, '\n'); if (!nl) break;
+    size_t len = nl - p; if (len >= sizeof(line)) len = sizeof(line) - 1;
+    memcpy(line, p, len); line[len] = '\0'; p = nl + 1;
+    strncpy(g_table_schemas[i].name, line, MAX_TABLE_NAME_LEN - 1);
+
+    nl = strchr(p, '\n'); if (!nl) break;
+    len = nl - p; if (len >= sizeof(line)) len = sizeof(line) - 1;
+    memcpy(line, p, len); line[len] = '\0'; p = nl + 1;
+    unsigned int num_cols = (unsigned int)atoi(line);
+    if (num_cols > MAX_COLUMNS) num_cols = MAX_COLUMNS;
+    g_table_schemas[i].num_columns = num_cols;
+
+    for (unsigned int j = 0; j < num_cols; ++j) {
+      nl = strchr(p, '\n'); if (!nl) break;
+      len = nl - p; if (len >= sizeof(line)) len = sizeof(line) - 1;
+      memcpy(line, p, len); line[len] = '\0'; p = nl + 1;
+      char colname[MAX_COLUMN_NAME_LEN]; unsigned int t=0, sz=0;
+      sscanf(line, "%[^	]\t%u\t%u", colname, &t, &sz);
+      strncpy(g_table_schemas[i].columns[j].name, colname, MAX_COLUMN_NAME_LEN - 1);
+      g_table_schemas[i].columns[j].type = (ColumType)t;
+      g_table_schemas[i].columns[j].size = (uint32_t)sz;
+    }
+    g_num_tables++;
+  }
+  free(loaded);
+  fprintf(stderr, "[SCHEMA_LOAD] loaded %u schemas\n", g_num_tables); fflush(stderr);
+}
+
+static void ems_sync_to_idb(void) {
+  // save schemas and then sync filesystem
+  ems_save_schemas();
+}
+
 static void ems_fs_init(void) {
   if (!emsfs_mounted) {
     EM_ASM({ try { FS.mkdir('/persistent'); } catch(e) {} try { FS.mount(IDBFS, {}, '/persistent'); } catch(e) {} });
     ems_sync_from_idb();
+    // after loading files from IDB, attempt to load schemas
+    ems_load_schemas();
     emsfs_mounted = 1;
   }
 }
@@ -2611,6 +3003,8 @@ static void ems_sync_from_idb(void) { (void)0; }
 static void ems_sync_to_idb(void) { (void)0; }
 static char* ems_path_for(const char* filename) { return strdup(filename); }
 static void ems_persist_flush(Table* table) { (void)table; }
+/* Non-ems stub for ems_save_schemas to avoid implicit declaration when building native */
+static void ems_save_schemas(void) { /* no-op on native builds */ }
 #endif
 
 MYDB_Handle mydb_open(const char* filename){
@@ -2645,6 +3039,11 @@ void mydb_close_with_ems(MYDB_Handle h) {
   if (!h) return;
   db_close((Table*)h);
   /* Ensure sync to persistent storage when applicable (no-op on native) */
+  /* native sidecar: explicitly serialize and save */
+  if (((Table*)h)->pager && ((Table*)h)->pager->filename) {
+    save_schemas_for_db(((Table*)h)->pager->filename);
+  }
+  /* Emscripten or unified save */
   ems_sync_to_idb();
 }
 
@@ -2781,8 +3180,10 @@ int mydb_execute_json_with_ems(MYDB_Handle h, const char* sql, char** out_json) 
     sb_init(&sb);
     sb_append(&sb, "{\"ok\":true,\"message\":\"Executed.\"}");
     *out_json = sb.buf;
-    /* Persist changes (Emscripten helper is a no-op on native builds) */
+    /* Persist changes: write global persistent schemas and flush/sync FS */
     ems_persist_flush(table);
+    /* Ensure the global persistent schemas file contains latest schemas */
+    ems_save_schemas();
     ems_sync_to_idb();
     free(ib.buffer);
     return 0;
@@ -2805,9 +3206,11 @@ int mydb_execute_json_with_ems(MYDB_Handle h, const char* sql, char** out_json) 
       sb_append(&sb, "{\"ok\":true}");
     }
     *out_json = sb.buf;
-    //使用ems 提供给前端调用
+    //使用ems 提供给前端调用：保存并同步到 IDB
     if (er != EXECUTE_DUPLICATE_KEY) {
       ems_persist_flush(table);
+      /* update global persistent schemas and sync */
+      ems_save_schemas();
       ems_sync_to_idb();
     }
     free(ib.buffer);
