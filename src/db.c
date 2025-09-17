@@ -15,7 +15,6 @@
 #include "libmydb.h"
 /** linux need */
 #include <sys/stat.h>
-static const char* EMS_DEFAULT_PERSIST_PATH = "/persistent/schemas.json";
 
 /* Simple debug logger to file to help trace crashes */
 static void dbg_log(const char* fmt, ...) {
@@ -663,8 +662,6 @@ extern TableSchema g_table_schemas[];
 extern uint32_t g_num_tables;
 void load_schemas_for_db(const char* dbfile);
 int save_schemas_for_db(const char* dbfile);
-int schema_store_save_str(const char* serialized, const char* dbfile);
-char* schema_store_load_str(const char* dbfile);
 void parse_schemas_from_str(char* loaded);
 
 static int catalog_find(Pager* pager, const char* name){
@@ -818,6 +815,10 @@ int handle_create_table_ex(Table* runtime_table, const char* sql) {
   printf("Table '%s' created with %d columns.\n", schema.name, schema.num_columns);
   /* Persist schemas immediately so CREATE TABLE is durable */
   if (runtime_table && runtime_table->pager && runtime_table->pager->filename) {
+    /* Ensure in-memory page0 (catalog) is flushed to disk before
+       embedding serialized schemas in the DB file. This prevents a
+       race where a new pager_open would read an out-of-date page0. */
+    pager_flush(runtime_table->pager, 0);
     int sres = save_schemas_for_db(runtime_table->pager->filename);
     if (sres != 0) {
       fprintf(stderr, "[CREATE_TABLE] failed to persist schemas: %d\n", sres);
@@ -1330,8 +1331,6 @@ void load_schemas_for_db(const char* dbfile) {
       size_t n = strlen(dbfile) + 9;
       char* side = malloc(n);
       if (side) {
-        snprintf(side, n, "%s.schemas", dbfile);
-        loaded = schema_store_load_str(side);
         free(side);
       }
     }
@@ -1441,24 +1440,9 @@ int save_schemas_for_db(const char* dbfile) {
     if (pager->filename) free(pager->filename);
     free(pager);
     rc = 0;
-  } else {
-    rc = schema_store_save_str(s, NULL);
   }
   free(s);
   return rc;
-}
-
-
-int schema_store_save_str(const char* serialized, const char* dbfile) {
-  if (!dbfile) {
-      // native 模式必须指定文件名
-      return -1;
-  }
-  FILE* f = fopen(dbfile, "w");
-  if (!f) return -1;
-  fwrite(serialized, 1, strlen(serialized), f);
-  fclose(f);
-  return 0;
 }
 
 
@@ -2841,29 +2825,6 @@ static void json_row_handler(Table* t,const void* row,const Statement* st,void* 
 }
 
 
-char* schema_store_load_str(const char* dbfile) {
-  const char* path = dbfile;
-#ifdef __EMSCRIPTEN__
-  if (!path) path = EMS_DEFAULT_PERSIST_PATH;
-#else
-  if (!path) return NULL; /* native requires explicit dbfile */
-#endif
-  FILE* f = fopen(path, "r");
-  if (!f) return NULL;
-  fseek(f, 0, SEEK_END);
-  long size = ftell(f);
-  rewind(f);
-  if (size <= 0) { fclose(f); return NULL; }
-  char* buf = (char*)malloc((size_t)size + 1);
-  if (!buf) { fclose(f); return NULL; }
-  fread(buf, 1, size, f);
-  buf[size] = '\0';
-  fclose(f);
-  return buf;
-}
-
-
-
 
 /* Abstract Emscripten helpers: provide real implementations when building
    for Emscripten, and no-op/stubs otherwise. This keeps the public
@@ -2874,28 +2835,6 @@ char* schema_store_load_str(const char* dbfile) {
 static int emsfs_mounted = 0;
 static void ems_sync_from_idb(void) {
   EM_ASM({ FS.syncfs(true, function(err) { if (err) { console.log('FS.syncfs(true) error', err); } }); });
-}
-
-
-int schema_store_save_str_ems(const char* serialized, const char* dbfile) {
-  const char* path = dbfile ? dbfile : EMS_DEFAULT_PERSIST_PATH;
-  fprintf(stderr, "[SCHEMA_SAVE] path=%s, len=%zu\n", path, strlen(serialized)); fflush(stderr);
-
-  FILE* f = fopen(path, "w");
-  if (!f) return -1;
-
-  fwrite(serialized, 1, strlen(serialized), f);
-  fclose(f);
-  fprintf(stderr, "[SCHEMA_SAVE] written %zu bytes to %s\n", strlen(serialized), path); fflush(stderr);
-
-  // 持久化到 IndexedDB
-  EM_ASM({ 
-      FS.syncfs(false, function(err) { 
-          if (err) console.log('FS.syncfs error', err); 
-      }); 
-  });
-
-  return 0;
 }
 
 // Save g_table_schemas to /persistent/schemas.json and sync to IDB
@@ -2921,14 +2860,11 @@ static void ems_save_schemas(void) {
     }
   }
   fprintf(stderr, "[EMS_SAVE_SCHEMAS] serializing %zu bytes\n", off); fflush(stderr);
-  schema_store_save_str_ems(buf, NULL);
-  fprintf(stderr, "[EMS_SAVE_SCHEMAS] schema_store_save_str_ems returned\n"); fflush(stderr);
   free(buf);
 }
 
 // Load g_table_schemas from /persistent/schemas.json if present
 static void ems_load_schemas(void) {
-  char* loaded = schema_store_load_str(NULL);
   if (!loaded) return;
   char* p = loaded;
   unsigned int count = 0;
@@ -3001,7 +2937,17 @@ static void ems_persist_flush(Table* table) {
 static void ems_fs_init(void) { }
 static void ems_sync_from_idb(void) { (void)0; }
 static void ems_sync_to_idb(void) { (void)0; }
-static char* ems_path_for(const char* filename) { return strdup(filename); }
+static char* ems_path_for(const char* filename) {
+#ifdef __EMSCRIPTEN__
+  size_t need = strlen(filename) + sizeof("/persistent/");
+  char* path = malloc(need);
+  if (!path) return NULL;
+  snprintf(path, need, "/persistent/%s", filename);
+  return path;
+#else
+  return strdup(filename);
+#endif
+}
 static void ems_persist_flush(Table* table) { (void)table; }
 /* Non-ems stub for ems_save_schemas to avoid implicit declaration when building native */
 static void ems_save_schemas(void) { /* no-op on native builds */ }
