@@ -16,6 +16,18 @@
 /** linux need */
 #include <sys/stat.h>
 
+/* Simple debug logger to file to help trace crashes */
+static void dbg_log(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  FILE* f = fopen("/tmp/mydb_debug.log", "a");
+  if (!f) { va_end(ap); return; }
+  vfprintf(f, fmt, ap);
+  fprintf(f, "\n");
+  fflush(f);
+  fclose(f);
+  va_end(ap);
+}
 
 typedef struct {
   char* buffer;
@@ -672,6 +684,7 @@ int lookup_table_schema(Pager* pager, const char* name, TableSchema* out_schema)
   CatalogEntry* ents = catalog_entries(pager);
   uint32_t sidx = ents[idx].schema_index;
   if (sidx >= g_num_tables) {
+    fprintf(stderr, "[LOOKUP_SCHEMA] invalid schema_index=%u (g_num_tables=%u)\n", sidx, g_num_tables);
     return -1;
   }
   *out_schema = g_table_schemas[sidx];
@@ -781,6 +794,7 @@ int handle_create_table_ex(Table* runtime_table, const char* sql) {
   // persist into catalog
   /* store schema in global schema table and reference by index from catalog */
   if (g_num_tables >= MAX_TABLES) {
+    fprintf(stderr, "[CREATE_TABLE] too many global schemas: %u\n", g_num_tables); fflush(stderr);
     return -5;
   }
   g_table_schemas[g_num_tables] = schema;
@@ -805,7 +819,10 @@ int handle_create_table_ex(Table* runtime_table, const char* sql) {
        embedding serialized schemas in the DB file. This prevents a
        race where a new pager_open would read an out-of-date page0. */
     pager_flush(runtime_table->pager, 0);
-    save_schemas_for_db(runtime_table->pager->filename);
+    int sres = save_schemas_for_db(runtime_table->pager->filename);
+    if (sres != 0) {
+      fprintf(stderr, "[CREATE_TABLE] failed to persist schemas: %d\n", sres);
+    }
   }
   return 0;
 }
@@ -949,13 +966,6 @@ uint32_t* leaf_node_num_cells(void* node) {
   return node + LEAF_NODE_NUM_CELLS_OFFSET;
 }
 
-// Debug helper to log node state when accessing cell count
-uint32_t get_leaf_node_cell_count_debug(void* node, const char* context) {
-  uint32_t count = *leaf_node_num_cells(node);
-  fprintf(stderr, "[DEBUG-NODE] %s: leaf node has %u cells\n", context, count); fflush(stderr);
-  return count;
-}
-
 uint32_t* leaf_node_next_leaf(void* node) {
   return node + LEAF_NODE_NEXT_LEAF_OFFSET;
 }
@@ -1071,12 +1081,10 @@ void deserialize_row(void* source, Row* destination) {
 }
 
 void initialize_leaf_node(void* node) {
-  fprintf(stderr, "[DEBUG-NODE] initialize_leaf_node: initializing new leaf node\n"); fflush(stderr);
   set_node_type(node, NODE_LEAF);
   set_node_root(node, false);
   *leaf_node_num_cells(node) = 0;
   *leaf_node_next_leaf(node) = 0;  // 0 represents no sibling
-  fprintf(stderr, "[DEBUG-NODE] initialize_leaf_node: node initialized with 0 cells\n"); fflush(stderr);
 }
 
 void initialize_internal_node(void* node) {
@@ -1092,10 +1100,8 @@ void initialize_internal_node(void* node) {
 }
 
 Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
-  fprintf(stderr, "[DEBUG-LEAF-FIND] leaf_node_find: searching page %u for key %u\n", page_num, key); fflush(stderr);
   void* node = get_page(table->pager, page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);
-  fprintf(stderr, "[DEBUG-LEAF-FIND] leaf_node_find: page %u has %u cells\n", page_num, num_cells); fflush(stderr);
 
   Cursor* cursor = malloc(sizeof(Cursor));
   cursor->table = table;
@@ -1105,28 +1111,20 @@ Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
   // Binary search
   uint32_t min_index = 0;
   uint32_t one_past_max_index = num_cells;
-  fprintf(stderr, "[DEBUG-LEAF-FIND] leaf_node_find: binary search range [%u, %u)\n", min_index, one_past_max_index); fflush(stderr);
-  
   while (one_past_max_index != min_index) {
     uint32_t index = (min_index + one_past_max_index) / 2;
     uint32_t key_at_index = *leaf_key_t(table, node, index);
-    fprintf(stderr, "[DEBUG-LEAF-FIND] leaf_node_find: comparing key %u with key_at_index[%u] = %u\n", key, index, key_at_index); fflush(stderr);
-    
     if (key == key_at_index) {
-      fprintf(stderr, "[DEBUG-LEAF-FIND] leaf_node_find: exact match found at cell %u\n", index); fflush(stderr);
       cursor->cell_num = index;
       return cursor;
     }
     if (key < key_at_index) {
       one_past_max_index = index;
-      fprintf(stderr, "[DEBUG-LEAF-FIND] leaf_node_find: key < key_at_index, searching [%u, %u)\n", min_index, one_past_max_index); fflush(stderr);
     } else {
       min_index = index + 1;
-      fprintf(stderr, "[DEBUG-LEAF-FIND] leaf_node_find: key > key_at_index, searching [%u, %u)\n", min_index, one_past_max_index); fflush(stderr);
     }
   }
 
-  fprintf(stderr, "[DEBUG-LEAF-FIND] leaf_node_find: no exact match, position for insertion: %u\n", min_index); fflush(stderr);
   cursor->cell_num = min_index;
   return cursor;
 }
@@ -1176,27 +1174,12 @@ If the key is not present, return the position
 where it should be inserted
 */
 Cursor* table_find(Table* table, uint32_t key) {
-  fprintf(stderr, "[DEBUG-FIND] table_find: searching for key=%u\n", key); fflush(stderr);
   uint32_t root_page_num = table->root_page_num;
-  fprintf(stderr, "[DEBUG-FIND] table_find: root_page_num=%u\n", root_page_num); fflush(stderr);
   void* root_node = get_page(table->pager, root_page_num);
 
-  NodeType node_type = get_node_type(root_node);
-  bool is_root = is_node_root(root_node);
-  fprintf(stderr, "[DEBUG-FIND] table_find: node_type=%d (0=INTERNAL, 1=LEAF), is_root=%d\n", node_type, is_root); fflush(stderr);
-  
-  // Let's also check the raw bytes of the node header
-  uint8_t* header = (uint8_t*)root_node;
-  fprintf(stderr, "[DEBUG-FIND] table_find: raw header bytes: [0]=%u, [1]=%u, [2-5]=%u,%u,%u,%u\n", 
-          header[0], header[1], header[2], header[3], header[4], header[5]); fflush(stderr);
-
-  if (node_type == NODE_LEAF) {
-    fprintf(stderr, "[DEBUG-FIND] table_find: root is leaf node, calling leaf_node_find\n"); fflush(stderr);
-    uint32_t num_cells = *leaf_node_num_cells(root_node);
-    fprintf(stderr, "[DEBUG-FIND] table_find: leaf root has %u cells\n", num_cells); fflush(stderr);
+  if (get_node_type(root_node) == NODE_LEAF) {
     return leaf_node_find(table, root_page_num, key);
   } else {
-    fprintf(stderr, "[DEBUG-FIND] table_find: root is internal node, calling internal_node_find\n"); fflush(stderr);
     return internal_node_find(table, root_page_num, key);
   }
 }
@@ -1571,6 +1554,18 @@ static void collect_values(char* start,Statement* st){
 
 
 PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* st){
+  /* Debug: print incoming parameters for prepare_insert */
+  if (!input_buffer) {
+    fprintf(stderr, "[DEBUG] prepare_insert: input_buffer is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] prepare_insert: input_buffer=%p, buffer='%s'\n", (void*)input_buffer, input_buffer->buffer ? input_buffer->buffer : "(null)");
+  }
+  if (!st) {
+    fprintf(stderr, "[DEBUG] prepare_insert: st is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] prepare_insert: st=%p\n", (void*)st);
+  }
+  fflush(stderr);
 
   st->type = STATEMENT_INSERT;
 
@@ -1604,6 +1599,23 @@ PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* st){
 
 PrepareResult prepare_statement(InputBuffer* input_buffer,
                                 Statement* statement,Table* table) {
+  /* Debug: print incoming parameters for prepare_statement */
+  if (!input_buffer) {
+    fprintf(stderr, "[DEBUG] prepare_statement: input_buffer is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] prepare_statement: input_buffer=%p, buffer='%s'\n", (void*)input_buffer, input_buffer->buffer ? input_buffer->buffer : "(null)");
+  }
+  if (!statement) {
+    fprintf(stderr, "[DEBUG] prepare_statement: statement is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] prepare_statement: statement=%p\n", (void*)statement);
+  }
+  if (!table) {
+    fprintf(stderr, "[DEBUG] prepare_statement: table is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] prepare_statement: table=%p\n", (void*)table);
+  }
+  fflush(stderr);
 
   const char* s = input_buffer->buffer;
   statement->where_ast = NULL;
@@ -1996,48 +2008,29 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, char* const* value
 }
 
 void leaf_node_insert(Cursor* cursor, uint32_t key, char* const* values, uint32_t nvals) {
-  fprintf(stderr, "[DEBUG-LEAF-INSERT] leaf_node_insert: key=%u, page_num=%u, cell_num=%u\n", 
-          key, cursor->page_num, cursor->cell_num); fflush(stderr);
-  
   void* node = get_page(cursor->table->pager, cursor->page_num);
 
   uint32_t num_cells = *leaf_node_num_cells(node);
-  uint32_t max_cells = leaf_max_cells(cursor->table);
-  fprintf(stderr, "[DEBUG-LEAF-INSERT] leaf_node_insert: current cells=%u, max_cells=%u\n", 
-          num_cells, max_cells); fflush(stderr);
-  
-  if (num_cells >= max_cells) {
+  if (num_cells >= leaf_max_cells(cursor->table)) {
     // Node full
-    fprintf(stderr, "[DEBUG-LEAF-INSERT] leaf_node_insert: node is full, splitting\n"); fflush(stderr);
     leaf_node_split_and_insert(cursor, key, values, nvals);
     return;
   }
 
   if (cursor->cell_num < num_cells) {
     // Make room for new cell (use signed index to avoid unsigned underflow)
-    fprintf(stderr, "[DEBUG-LEAF-INSERT] leaf_node_insert: shifting cells from %u to %u\n", 
-            cursor->cell_num, num_cells); fflush(stderr);
     for (int64_t ii = (int64_t)num_cells; ii > (int64_t)cursor->cell_num; --ii) {
       uint32_t i = (uint32_t)ii;
       memcpy(leaf_cell_t(cursor->table, node, i),
              leaf_cell_t(cursor->table, node, i - 1),
              leaf_cell_size(cursor->table));
     }
-  } else {
-    fprintf(stderr, "[DEBUG-LEAF-INSERT] leaf_node_insert: inserting at end (cell_num=%u, num_cells=%u)\n", 
-            cursor->cell_num, num_cells); fflush(stderr);
   }
 
-  fprintf(stderr, "[DEBUG-LEAF-INSERT] leaf_node_insert: updating cell count from %u to %u\n", 
-          num_cells, num_cells + 1); fflush(stderr);
   *(leaf_node_num_cells(node)) += 1;
   *(leaf_key_t(cursor->table, node, cursor->cell_num)) = key;
   serialize_row_dynamic(cursor->table, values, nvals, 
                         leaf_value_t(cursor->table, node, cursor->cell_num));
-  
-  uint32_t final_cells = *leaf_node_num_cells(node);
-  fprintf(stderr, "[DEBUG-LEAF-INSERT] leaf_node_insert: completed, final cell count=%u\n", 
-          final_cells); fflush(stderr);
 }
 
 
@@ -2077,30 +2070,19 @@ static void serialize_row_dynamic(Table* t,char* const* values,uint32_t n, void*
 
 
 ExecuteResult execute_insert(Statement* st, Table* table) {
-  fprintf(stderr, "[DEBUG-INSERT] Starting INSERT operation\n"); fflush(stderr);
-  
   if (table->root_page_num == INVALID_PAGE_NUM) {
-    fprintf(stderr, "[DEBUG-INSERT] No active table (root_page_num=INVALID)\n"); fflush(stderr);
     printf("No active table. Use 'use <table>' or 'insert into <table> ...' first.\n");
     return EXECUTE_SUCCESS;
   }
 
-  fprintf(stderr, "[DEBUG-INSERT] Current table root_page_num=%u\n", table->root_page_num); fflush(stderr);
-
   // 如果是 insert into <table>，切表
   if (st->target_table[0]) {
-    fprintf(stderr, "[DEBUG-INSERT] Switching to target table: %s\n", st->target_table); fflush(stderr);
     int idx = catalog_find(table->pager, st->target_table);
-    if (idx < 0) { 
-      fprintf(stderr, "[DEBUG-INSERT] Table not found: %s\n", st->target_table); fflush(stderr);
-      printf("Table not found: %s\n", st->target_table); 
-      return EXECUTE_SUCCESS; 
-    }
+    if (idx < 0) { printf("Table not found: %s\n", st->target_table); return EXECUTE_SUCCESS; }
     CatalogEntry* ents = catalog_entries(table->pager);
     table->root_page_num = ents[idx].root_page_num;
     /* get schema from global schema table by schema_index */
     uint32_t sidx = ents[idx].schema_index;
-    fprintf(stderr, "[DEBUG-INSERT] Switched to table, new root_page_num=%u, schema_index=%u\n", table->root_page_num, sidx); fflush(stderr);
     if (sidx < g_num_tables) {
       table->active_schema = g_table_schemas[sidx];
     } else {
@@ -2111,64 +2093,42 @@ ExecuteResult execute_insert(Statement* st, Table* table) {
 
   // 主键取第一列，要求为 int
   if (table->active_schema.num_columns == 0 || table->active_schema.columns[0].type != COL_TYPE_INT) {
-    fprintf(stderr, "[DEBUG-INSERT] Schema validation failed: num_columns=%u, first_col_type=%d\n", 
-            table->active_schema.num_columns, 
-            table->active_schema.num_columns > 0 ? table->active_schema.columns[0].type : -1); fflush(stderr);
     printf("First column must be int primary key.\n");
     return EXECUTE_SUCCESS;
   }
   int key_int = 0;
   if (st->num_values == 0 || parse_int(st->values[0], &key_int) != 0) {
-    fprintf(stderr, "[DEBUG-INSERT] Key parsing failed: num_values=%u, first_value=%s\n", 
-            st->num_values, st->num_values > 0 ? st->values[0] : "NULL"); fflush(stderr);
     printf("Invalid key.\n");
     return EXECUTE_SUCCESS;
   }
   uint32_t key = (uint32_t)key_int;
-  fprintf(stderr, "[DEBUG-INSERT] Attempting to insert key=%u\n", key); fflush(stderr);
 
   Cursor* cursor = table_find(table, key);
-  fprintf(stderr, "[DEBUG-INSERT] table_find returned: page_num=%u, cell_num=%u\n", 
-          cursor->page_num, cursor->cell_num); fflush(stderr);
-          
   void* node = get_page(table->pager, cursor->page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);
-  fprintf(stderr, "[DEBUG-INSERT] Node has %u cells\n", num_cells); fflush(stderr);
-  
   if (cursor->cell_num < num_cells) {
     uint32_t key_at_index = *leaf_key_t(table, node, cursor->cell_num);
-    fprintf(stderr, "[DEBUG-INSERT] Key at cursor position: %u (searching for %u)\n", key_at_index, key); fflush(stderr);
     if (key_at_index == key) {
-      fprintf(stderr, "[DEBUG-INSERT] Duplicate key detected: %u\n", key); fflush(stderr);
       free(cursor);
       return EXECUTE_DUPLICATE_KEY;
     }
-  } else {
-    fprintf(stderr, "[DEBUG-INSERT] Cursor at end position (cell_num=%u >= num_cells=%u)\n", cursor->cell_num, num_cells); fflush(stderr);
   }
 
-  fprintf(stderr, "[DEBUG-INSERT] Proceeding with leaf_node_insert for key=%u\n", key); fflush(stderr);
   leaf_node_insert(cursor, key, st->values, st->num_values);
-  fprintf(stderr, "[DEBUG-INSERT] leaf_node_insert completed successfully\n"); fflush(stderr);
   free(cursor);
   return EXECUTE_SUCCESS;
 }
 
 ExecuteResult execute_delete(Statement* st,Table* table){
-  fprintf(stderr, "[DEBUG-DELETE] Starting DELETE operation\n"); fflush(stderr);
-  
   if(st->target_table[0]){
-    fprintf(stderr, "[DEBUG-DELETE] Switching to target table: %s\n", st->target_table); fflush(stderr);
     int idx = catalog_find(table->pager,st->target_table);
     if(idx < 0){
-      fprintf(stderr, "[DEBUG-DELETE] Table not found: %s\n", st->target_table); fflush(stderr);
       printf("Table not found: %s\n", st->target_table);
       return EXECUTE_SUCCESS;
     }
     CatalogEntry* ents = catalog_entries(table->pager);
     table->root_page_num = ents[idx].root_page_num;
     uint32_t sidx = ents[idx].schema_index;
-    fprintf(stderr, "[DEBUG-DELETE] Switched to table, root_page_num=%u, schema_index=%u\n", table->root_page_num, sidx); fflush(stderr);
     if (sidx < g_num_tables) {
       table->active_schema = g_table_schemas[sidx];
     } else {
@@ -2178,18 +2138,14 @@ ExecuteResult execute_delete(Statement* st,Table* table){
   }
 
   if(table->root_page_num == INVALID_PAGE_NUM){
-    fprintf(stderr, "[DEBUG-DELETE] No active table (root_page_num=INVALID)\n"); fflush(stderr);
     printf("No active table. Use 'use <table>' or 'create table..' first.\n");
     return EXECUTE_SUCCESS;
   }
-
-  fprintf(stderr, "[DEBUG-DELETE] Current table root_page_num=%u\n", table->root_page_num); fflush(stderr);
 
   uint32_t key = 0;
   int have_key = 0;
 
   if(st->where_ast){
-    fprintf(stderr, "[DEBUG-DELETE] Processing WHERE AST\n"); fflush(stderr);
     Expr* ast = st->where_ast;
     if(ast && ast->kind == EXPR_BINARY && strcmp(ast->op,"=") == 0){
       Expr* left = ast->left;
@@ -2207,13 +2163,11 @@ ExecuteResult execute_delete(Statement* st,Table* table){
   
       if(colExpr && litExpr){
         int col_idx = schema_col_index(&table->active_schema,colExpr->text);
-        fprintf(stderr, "[DEBUG-DELETE] WHERE clause: column=%s (idx=%d), value=%s\n", colExpr->text, col_idx, litExpr->text); fflush(stderr);
         if(col_idx == 0 && table->active_schema.columns[0].type == COL_TYPE_INT){
           int v = 0;
           if(parse_int(litExpr->text,&v) == 0){
             key = (uint32_t)v;
             have_key = 1;
-            fprintf(stderr, "[DEBUG-DELETE] Extracted key from WHERE: %u\n", key); fflush(stderr);
           }
         }
       }
@@ -2221,48 +2175,33 @@ ExecuteResult execute_delete(Statement* st,Table* table){
   }
 
   if(!have_key){
-    fprintf(stderr, "[DEBUG-DELETE] Trying legacy WHERE format\n"); fflush(stderr);
     if(st->has_where && st->where_col_index == 0 && !st->where_is_string &&
       table->active_schema.columns[0].type == COL_TYPE_INT){
         key = (uint32_t)st->where_int;
         have_key = 1;
-        fprintf(stderr, "[DEBUG-DELETE] Using legacy WHERE key: %u\n", key); fflush(stderr);
       }
   }
 
   if (!have_key) {
-    fprintf(stderr, "[DEBUG-DELETE] No valid key found in WHERE clause\n"); fflush(stderr);
     printf("Only DELETE by integer primary key is supported.\n");
     return EXECUTE_SUCCESS;
   }
 
-  fprintf(stderr, "[DEBUG-DELETE] Searching for key to delete: %u\n", key); fflush(stderr);
   Cursor* cursor = table_find(table,key);
-  fprintf(stderr, "[DEBUG-DELETE] table_find returned: page_num=%u, cell_num=%u\n", cursor->page_num, cursor->cell_num); fflush(stderr);
-  
   void* node = get_page(table->pager,cursor->page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);
-  fprintf(stderr, "[DEBUG-DELETE] Node has %u cells before deletion\n", num_cells); fflush(stderr);
-  
   if(cursor->cell_num >= num_cells){
-    fprintf(stderr, "[DEBUG-DELETE] Key not found: cursor position (%u) >= num_cells (%u)\n", cursor->cell_num, num_cells); fflush(stderr);
     free(cursor);
     return EXECUTE_SUCCESS;
   }
   uint32_t key_at_index = *leaf_key_t(table,node,cursor->cell_num);
-  fprintf(stderr, "[DEBUG-DELETE] Key at cursor position: %u (looking for %u)\n", key_at_index, key); fflush(stderr);
   if(key_at_index != key){
-    fprintf(stderr, "[DEBUG-DELETE] Key mismatch: found %u but looking for %u\n", key_at_index, key); fflush(stderr);
     free(cursor);
     return EXECUTE_SUCCESS;
   }
 
-  fprintf(stderr, "[DEBUG-DELETE] Found key %u, proceeding with deletion\n", key); fflush(stderr);
   uint32_t old_leaf_max = get_node_max_key(table,node);
-  fprintf(stderr, "[DEBUG-DELETE] Node max key before deletion: %u\n", old_leaf_max); fflush(stderr);
 
-  // 执行删除操作：将后面的cell向前移动
-  fprintf(stderr, "[DEBUG-DELETE] Shifting cells: from position %u to %u\n", cursor->cell_num, num_cells - 1); fflush(stderr);
   for(uint32_t i = cursor->cell_num ; i < num_cells - 1; i++){
     void* dest = leaf_cell_t(table, node, i);
     void* src = leaf_cell_t(table, node, i + 1);
@@ -2272,33 +2211,23 @@ ExecuteResult execute_delete(Statement* st,Table* table){
   memset(last_cell, 0 , leaf_cell_size(table));
   *(leaf_node_num_cells(node)) = num_cells - 1;
 
-  uint32_t new_num = *leaf_node_num_cells(node);
-  fprintf(stderr, "[DEBUG-DELETE] Node has %u cells after deletion\n", new_num); fflush(stderr);
 
   uint32_t new_max = 0;
+  uint32_t new_num = *leaf_node_num_cells(node);
   if(new_num > 0){
     new_max = *leaf_key_t(table, node, new_num - 1);
-    fprintf(stderr, "[DEBUG-DELETE] New node max key: %u\n", new_max); fflush(stderr);
   } else {
     new_max = 0;
-    fprintf(stderr, "[DEBUG-DELETE] Node is now empty (new_max=0)\n"); fflush(stderr);
   }
 
   if(old_leaf_max != new_max){
-    fprintf(stderr, "[DEBUG-DELETE] Node max key changed from %u to %u\n", old_leaf_max, new_max); fflush(stderr);
     if(!is_node_root(node)){
       uint32_t parent_page = *node_parent(node);
-      fprintf(stderr, "[DEBUG-DELETE] Updating parent node (page %u) key: %u -> %u\n", parent_page, old_leaf_max, new_max); fflush(stderr);
       void* parent = get_page(table->pager,parent_page);
       update_internal_node_key(parent,old_leaf_max,new_max);
-    } else {
-      fprintf(stderr, "[DEBUG-DELETE] Node is root, no parent to update\n"); fflush(stderr);
     }
-  } else {
-    fprintf(stderr, "[DEBUG-DELETE] Node max key unchanged (%u)\n", old_leaf_max); fflush(stderr);
   }
 
-  fprintf(stderr, "[DEBUG-DELETE] Delete operation completed successfully\n"); fflush(stderr);
   free(cursor);
   return EXECUTE_SUCCESS;
 }
@@ -2353,43 +2282,63 @@ static int eval_expr_to_bool(Table* t, const void* row, Expr* e) {
     char rhs_s[512] = {0};
     int is_num = 0;
     
+    /* Debug output for WHERE condition evaluation */
+    fprintf(stderr, "[DEBUG] eval_expr_to_bool: comparing %s with op='%s'\n", 
+            (e->left->kind == EXPR_COLUMN ? e->left->text : "literal"),
+            e->op);
 
     if (e->left->kind == EXPR_COLUMN) {
       int idx = schema_col_index(&t->active_schema, e->left->text);
+      fprintf(stderr, "[DEBUG] left column '%s' idx=%d\n", e->left->text, idx);
       if (idx >= 0 && t->active_schema.columns[idx].type == COL_TYPE_INT) {
         lhs_int = row_get_int(t, row, idx);
         is_num = 1;
+        fprintf(stderr, "[DEBUG] left is INT: %d\n", lhs_int);
       } else if (idx >= 0) {
         row_get_string(t, row, idx, lhs_s, sizeof(lhs_s));
+        fprintf(stderr, "[DEBUG] left is STRING: '%s'\n", lhs_s);
       }
 
     } else if (e->left->kind == EXPR_LITERAL) {
+      fprintf(stderr, "[DEBUG] left literal '%s'\n", e->left->text);
       if (parse_int(e->left->text, &lhs_int) == 0) {
         is_num = 1;
+        fprintf(stderr, "[DEBUG] left parsed as INT: %d\n", lhs_int);
       } else {
         strncpy(lhs_s, e->left->text, sizeof(lhs_s) - 1);
         lhs_s[sizeof(lhs_s) - 1] = '\0';
+        fprintf(stderr, "[DEBUG] left as STRING: '%s'\n", lhs_s);
       }
     }
 
     if (e->right->kind == EXPR_COLUMN) {
       int idx = schema_col_index(&t->active_schema, e->right->text);
+      fprintf(stderr, "[DEBUG] right column '%s' idx=%d\n", e->right->text, idx);
       if (idx >= 0 && t->active_schema.columns[idx].type == COL_TYPE_INT) {
         rhs_int = row_get_int(t, row, idx);
         is_num = 1;
+        fprintf(stderr, "[DEBUG] right is INT: %d\n", rhs_int);
       } else if (idx >= 0) {
         row_get_string(t, row, idx, rhs_s, sizeof(rhs_s));
+        fprintf(stderr, "[DEBUG] right is STRING: '%s'\n", rhs_s);
       }
     } else if (e->right->kind == EXPR_LITERAL) {
+      fprintf(stderr, "[DEBUG] right literal '%s'\n", e->right->text);
       if (parse_int(e->right->text, &rhs_int) == 0) {
         is_num = 1;
+        fprintf(stderr, "[DEBUG] right parsed as INT: %d\n", rhs_int);
       } else {
         strncpy(rhs_s, e->right->text, sizeof(rhs_s) - 1);
         rhs_s[sizeof(rhs_s) - 1] = '\0';
+        fprintf(stderr, "[DEBUG] right as STRING: '%s'\n", rhs_s);
       }
     }
 
+    fprintf(stderr, "[DEBUG] comparison mode: %s (is_num=%d)\n", 
+            is_num ? "NUMERIC" : "STRING", is_num);
+    
     if (is_num) {
+      fprintf(stderr, "[DEBUG] numeric comparison: %d %s %d\n", lhs_int, e->op, rhs_int);
       if (strcmp(e->op, "=") == 0) return lhs_int == rhs_int;
       if (strcmp(e->op, "!=") == 0) return lhs_int != rhs_int;
       if (strcmp(e->op, "<") == 0) return lhs_int < rhs_int;
@@ -2397,9 +2346,13 @@ static int eval_expr_to_bool(Table* t, const void* row, Expr* e) {
       if (strcmp(e->op, ">") == 0) return lhs_int > rhs_int;
       if (strcmp(e->op, ">=") == 0) return lhs_int >= rhs_int;
     } else {
+      fprintf(stderr, "[DEBUG] string comparison: '%s' %s '%s'\n", lhs_s, e->op, rhs_s);
       int result = strcmp(lhs_s, rhs_s);
+      fprintf(stderr, "[DEBUG] strcmp result: %d\n", result);
       if (strcmp(e->op, "=") == 0) {
-        return (result == 0);
+        int match = (result == 0);
+        fprintf(stderr, "[DEBUG] string equality result: %d\n", match);
+        return match;
       }
       if (strcmp(e->op, "!=") == 0) return strcmp(lhs_s, rhs_s) != 0;
       if (strcmp(e->op, "<") == 0) return strcmp(lhs_s, rhs_s) < 0;
@@ -2483,6 +2436,26 @@ static void print_row_handler(Table* t,const void* row,const Statement* st,void*
 
 ExecuteResult execute_select_core(Statement* st, Table* table, RowHandler handler,void* ctx) {
 
+  /* Detailed debug logging to trace segfaults */
+  fprintf(stderr, "[DEBUG] execute_select_core: st=%p, table=%p, handler=%p, ctx=%p\n", (void*)st, (void*)table, (void*)handler, ctx);
+  if (st) {
+    fprintf(stderr, "[DEBUG] execute_select_core: st->target_table='%s', proj_count=%u, has_where=%d\n",
+            st->target_table, st->proj_count, st->has_where ? 1 : 0);
+  }
+  if (table) {
+    fprintf(stderr, "[DEBUG] execute_select_core: table=%p, pager=%p, root_page_num=%u, row_size=%u\n",
+            (void*)table, (void*)table->pager, table->root_page_num, table->row_size);
+    if (table->pager) {
+      fprintf(stderr, "[DEBUG] execute_select_core: pager->file_descriptor=%d, file_length=%u, num_pages=%u\n",
+              table->pager->file_descriptor, table->pager->file_length, table->pager->num_pages);
+    }
+    fprintf(stderr, "[DEBUG] execute_select_core: active_schema.name='%s', num_columns=%u\n",
+            table->active_schema.name, table->active_schema.num_columns);
+    for (uint32_t _i = 0; _i < table->active_schema.num_columns && _i < 10; ++_i) {
+      ColumnDef* _c = &table->active_schema.columns[_i];
+      fprintf(stderr, "[DEBUG] execute_select_core: col[%u] name='%s' type=%d size=%u\n", _i, _c->name, (int)_c->type, _c->size);
+    }
+  }
 
   if(st->target_table[0]){
     int idx = catalog_find(table->pager,st->target_table);
@@ -2990,6 +2963,19 @@ void mydb_close_with_ems(MYDB_Handle h) {
 
 int mydb_execute_json(MYDB_Handle h,const char* sql,char** out_json){
 
+  /* Debug: print incoming parameters */
+  if (h == NULL) {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: handle is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: handle=%p\n", (void*)h);
+  }
+  if (sql == NULL) {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: sql is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: sql='%s'\n", sql);
+  }
+  fflush(stderr);
+
   if(!out_json){
     return -1;
   }
@@ -3008,6 +2994,8 @@ int mydb_execute_json(MYDB_Handle h,const char* sql,char** out_json){
   memset(&st, 0, sizeof(st));
   st.where_ast = NULL;
   PrepareResult pr = prepare_statement(&ib,&st,table);
+  fprintf(stderr, "[DEBUG] mydb_execute_json: prepared statement, pr=%d, type=%d\n", pr, st.type);
+  fflush(stderr);
   if(pr == PREPARE_SYNTAX_ERROR){
     free(ib.buffer);
     return -3;
@@ -3027,7 +3015,9 @@ int mydb_execute_json(MYDB_Handle h,const char* sql,char** out_json){
   }
 
   if (st.type == STATEMENT_INSERT || st.type == STATEMENT_DELETE) {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: about to execute insert/delete\n"); fflush(stderr);
     ExecuteResult er = execute_statement(&st, table);
+    fprintf(stderr, "[DEBUG] mydb_execute_json: execute_statement returned %d\n", er); fflush(stderr);
     StrBuf sb; 
     sb_init(&sb);
     if (er == EXECUTE_DUPLICATE_KEY) {
@@ -3045,7 +3035,9 @@ int mydb_execute_json(MYDB_Handle h,const char* sql,char** out_json){
     sb_init(&sb);
     sb_append(&sb, "{\"ok\":true,\"rows\":[");
     JsonCtx jctx = {.sb = &sb, .first = 1 };
+    fprintf(stderr, "[DEBUG] mydb_execute_json: about to execute select_core\n"); fflush(stderr);
     execute_select_core(&st,table,json_row_handler,&jctx);
+    fprintf(stderr, "[DEBUG] mydb_execute_json: returned from select_core\n"); fflush(stderr);
 
     sb_append(&sb,"]}");
     *out_json = sb.buf;
@@ -3059,19 +3051,27 @@ int mydb_execute_json(MYDB_Handle h,const char* sql,char** out_json){
 
 
 int mydb_execute_json_with_ems(MYDB_Handle h, const char* sql, char** out_json) {
-  fprintf(stderr, "[DEBUG-WASM] mydb_execute_json_with_ems called with SQL: %s\n", sql ? sql : "NULL"); fflush(stderr);
+  /* Debug: print incoming parameters */
+  if (h == NULL) {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: handle is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: handle=%p\n", (void*)h);
+  }
+  if (sql == NULL) {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: sql is NULL\n");
+  } else {
+    fprintf(stderr, "[DEBUG] mydb_execute_json: sql='%s'\n", sql);
+  }
+  fflush(stderr);
 
   if(!out_json){
-    fprintf(stderr, "[DEBUG-WASM] out_json parameter is NULL\n"); fflush(stderr);
     return -1;
   }
   *out_json = NULL;
   if(!h || !sql){
-    fprintf(stderr, "[DEBUG-WASM] Invalid parameters: h=%p, sql=%p\n", (void*)h, (void*)sql); fflush(stderr);
     return -2;
   }
   Table* table = (Table*)h;
-  fprintf(stderr, "[DEBUG-WASM] Table handle: root_page_num=%u\n", table->root_page_num); fflush(stderr);
 
   InputBuffer ib;
   ib.buffer = strdup(sql);
@@ -3081,29 +3081,24 @@ int mydb_execute_json_with_ems(MYDB_Handle h, const char* sql, char** out_json) 
   Statement st;
   memset(&st, 0, sizeof(st));
   st.where_ast = NULL;
-  fprintf(stderr, "[DEBUG-WASM] About to prepare statement\n"); fflush(stderr);
   PrepareResult pr = prepare_statement(&ib,&st,table);
-  fprintf(stderr, "[DEBUG-WASM] prepare_statement returned: %d\n", pr); fflush(stderr);
-  
+  fprintf(stderr, "[DEBUG] mydb_execute_json: prepared statement, pr=%d, type=%d\n", pr, st.type);
+  fflush(stderr);
   if(pr == PREPARE_SYNTAX_ERROR){
-    fprintf(stderr, "[DEBUG-WASM] Syntax error in SQL\n"); fflush(stderr);
     free(ib.buffer);
     return -3;
   }
   if(pr == PREPARE_CREATE_TABLE_DONE){
-    fprintf(stderr, "[DEBUG-WASM] CREATE TABLE executed\n"); fflush(stderr);
     StrBuf sb;
     sb_init(&sb);
     sb_append(&sb, "{\"ok\":true,\"message\":\"Executed.\"}");
     *out_json = sb.buf;
     /* Persist schemas into the .db file and sync FS */
     if (table && table->pager && table->pager->filename) {
-      fprintf(stderr, "[DEBUG-WASM] Persisting with filename: %s\n", table->pager->filename); fflush(stderr);
       ems_persist_flush(table);
       save_schemas_for_db(table->pager->filename);
       ems_sync_to_idb();
     } else {
-      fprintf(stderr, "[DEBUG-WASM] Persisting without filename\n"); fflush(stderr);
       ems_persist_flush(table);
       ems_sync_to_idb();
     }
@@ -3112,45 +3107,32 @@ int mydb_execute_json_with_ems(MYDB_Handle h, const char* sql, char** out_json) 
   }
 
   if(pr != PREPARE_SUCCESS){
-    fprintf(stderr, "[DEBUG-WASM] Prepare failed with code: %d\n", pr); fflush(stderr);
     free(ib.buffer);
     return -4;
   }
 
   if (st.type == STATEMENT_INSERT || st.type == STATEMENT_DELETE) {
-    fprintf(stderr, "[DEBUG-WASM] About to execute %s statement\n", 
-            st.type == STATEMENT_INSERT ? "INSERT" : "DELETE"); fflush(stderr);
-    fprintf(stderr, "[DEBUG-WASM] Table state before execute: root_page_num=%u\n", table->root_page_num); fflush(stderr);
-    
+    fprintf(stderr, "[DEBUG] mydb_execute_json: about to execute insert/delete\n"); fflush(stderr);
     ExecuteResult er = execute_statement(&st, table);
-    fprintf(stderr, "[DEBUG-WASM] execute_statement returned: %d\n", er); fflush(stderr);
-    
+    fprintf(stderr, "[DEBUG] mydb_execute_json: execute_statement returned %d\n", er); fflush(stderr);
     StrBuf sb; 
     sb_init(&sb);
     if (er == EXECUTE_DUPLICATE_KEY) {
-      fprintf(stderr, "[DEBUG-WASM] Duplicate key error\n"); fflush(stderr);
       sb_append(&sb, "{\"ok\":false,\"error\":\"duplicate_key\"}");
     } else {
-      fprintf(stderr, "[DEBUG-WASM] Execution successful\n"); fflush(stderr);
       sb_append(&sb, "{\"ok\":true}");
     }
     *out_json = sb.buf;
     //使用ems 提供给前端调用：保存并同步到 IDB
     if (er != EXECUTE_DUPLICATE_KEY) {
-      fprintf(stderr, "[DEBUG-WASM] Starting persistence...\n"); fflush(stderr);
       if (table && table->pager && table->pager->filename) {
-        fprintf(stderr, "[DEBUG-WASM] Persisting to file: %s\n", table->pager->filename); fflush(stderr);
         ems_persist_flush(table);
         save_schemas_for_db(table->pager->filename);
         ems_sync_to_idb();
       } else {
-        fprintf(stderr, "[DEBUG-WASM] Persisting without filename\n"); fflush(stderr);
         ems_persist_flush(table);
         ems_sync_to_idb();
       }
-      fprintf(stderr, "[DEBUG-WASM] Persistence completed\n"); fflush(stderr);
-    } else {
-      fprintf(stderr, "[DEBUG-WASM] Skipping persistence due to duplicate key\n"); fflush(stderr);
     }
     free(ib.buffer);
     return 0;
@@ -3161,7 +3143,9 @@ int mydb_execute_json_with_ems(MYDB_Handle h, const char* sql, char** out_json) 
     sb_init(&sb);
     sb_append(&sb, "{\"ok\":true,\"rows\":[");
     JsonCtx jctx = {.sb = &sb, .first = 1 };
+    fprintf(stderr, "[DEBUG] mydb_execute_json: about to execute select_core\n"); fflush(stderr);
     execute_select_core(&st,table,json_row_handler,&jctx);
+    fprintf(stderr, "[DEBUG] mydb_execute_json: returned from select_core\n"); fflush(stderr);
 
     sb_append(&sb,"]}");
     *out_json = sb.buf;

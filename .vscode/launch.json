@@ -6,7 +6,7 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/src/bin/mydb",
-            "args": ["testInset.db"],
+            "args": ["testCreateTables3.db"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],
