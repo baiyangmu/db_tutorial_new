@@ -1,0 +1,157 @@
+# MyDB Makefile - Modular Version
+# ==================================
+
+CC = gcc
+CFLAGS = -Wall -Wextra -std=c11 -g -I./include
+LDFLAGS =
+
+# Directories
+SRC_DIR = impl
+INC_DIR = include
+TEST_DIR = test
+BIN_DIR = bin
+
+# Source files
+IMPL_SOURCES = $(wildcard $(SRC_DIR)/*.c)
+PARSER_SOURCES = sql_lexer.c sql_parser.c
+MAIN_SOURCE = main.c
+
+# Object files
+IMPL_OBJECTS = $(IMPL_SOURCES:$(SRC_DIR)/%.c=$(BIN_DIR)/%.o)
+PARSER_OBJECTS = $(PARSER_SOURCES:%.c=$(BIN_DIR)/%.o)
+MAIN_OBJECT = $(BIN_DIR)/main.o
+
+# Test files
+TEST_SOURCES = $(wildcard $(TEST_DIR)/test_*.c)
+TEST_BINARIES = $(TEST_SOURCES:$(TEST_DIR)/%.c=$(BIN_DIR)/%)
+
+# Targets
+TARGET = db
+LIB_TARGET = libmydb.so
+TEST_RUNNER = $(BIN_DIR)/test_runner
+
+# ==================================
+# Main Targets
+# ==================================
+
+.PHONY: all clean test run-test help
+
+all: $(TARGET)
+
+# Main executable
+$(TARGET): $(IMPL_OBJECTS) $(PARSER_OBJECTS) $(MAIN_OBJECT)
+	@echo "Linking $@..."
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "✓ Build complete: $@"
+
+# Shared library (for WASM/external use)
+$(LIB_TARGET): $(IMPL_OBJECTS) $(PARSER_OBJECTS)
+	@echo "Building shared library..."
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ $^ $(LDFLAGS)
+	@echo "✓ Library built: $@"
+
+# ==================================
+# Object File Rules
+# ==================================
+
+# Create bin directory
+$(BIN_DIR):
+	@mkdir -p $(BIN_DIR)
+
+# Compile implementation files
+$(BIN_DIR)/%.o: $(SRC_DIR)/%.c | $(BIN_DIR)
+	@echo "Compiling $<..."
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Compile parser files
+$(BIN_DIR)/%.o: %.c | $(BIN_DIR)
+	@echo "Compiling $<..."
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Compile main
+$(BIN_DIR)/main.o: main.c | $(BIN_DIR)
+	@echo "Compiling main.c..."
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# ==================================
+# Test Targets
+# ==================================
+
+test: $(TEST_BINARIES)
+	@echo "✓ All tests compiled"
+
+# Compile individual test files
+$(BIN_DIR)/test_%: $(TEST_DIR)/test_%.c $(IMPL_OBJECTS) $(PARSER_OBJECTS) | $(BIN_DIR)
+	@echo "Compiling test: $<..."
+	$(CC) $(CFLAGS) -o $@ $< $(IMPL_OBJECTS) $(PARSER_OBJECTS) $(LDFLAGS)
+
+# Run all tests
+run-test: test
+	@echo ""
+	@echo "╔════════════════════════════════════════╗"
+	@echo "║   Running MyDB Unit Tests              ║"
+	@echo "╚════════════════════════════════════════╝"
+	@echo ""
+	@for test in $(TEST_BINARIES); do \
+		echo "Running $$test..."; \
+		$$test || exit 1; \
+		echo ""; \
+	done
+	@echo "✓ All tests passed!"
+
+# ==================================
+# Utility Targets
+# ==================================
+
+clean:
+	@echo "Cleaning build artifacts..."
+	rm -rf $(BIN_DIR)
+	rm -f $(TARGET) $(LIB_TARGET)
+	rm -f *.db *.db-journal
+	@echo "✓ Clean complete"
+
+help:
+	@echo "MyDB Makefile - Available Targets:"
+	@echo ""
+	@echo "  make              - Build main executable"
+	@echo "  make all          - Same as 'make'"
+	@echo "  make lib          - Build shared library"
+	@echo "  make test         - Compile all tests"
+	@echo "  make run-test     - Compile and run all tests"
+	@echo "  make clean        - Remove all build artifacts"
+	@echo "  make help         - Show this help message"
+	@echo ""
+	@echo "Directory Structure:"
+	@echo "  include/          - Header files"
+	@echo "  impl/             - Implementation files"
+	@echo "  test/             - Unit test files"
+	@echo "  bin/              - Build output (auto-created)"
+	@echo ""
+
+# ==================================
+# Dependencies
+# ==================================
+
+# Header dependencies (simplified - add more as needed)
+$(IMPL_OBJECTS): $(wildcard $(INC_DIR)/*.h)
+$(PARSER_OBJECTS): sql_ast.h sql_parser.h
+$(MAIN_OBJECT): $(INC_DIR)/btree.h $(INC_DIR)/repl.h $(INC_DIR)/sql_executor.h
+
+# ==================================
+# Debug Targets
+# ==================================
+
+.PHONY: debug info
+
+debug: CFLAGS += -DDEBUG -O0
+debug: clean all
+	@echo "✓ Debug build complete"
+
+info:
+	@echo "Build Information:"
+	@echo "  CC:       $(CC)"
+	@echo "  CFLAGS:   $(CFLAGS)"
+	@echo "  Sources:  $(words $(IMPL_SOURCES)) impl files"
+	@echo "  Tests:    $(words $(TEST_SOURCES)) test files"
+	@echo ""
+
