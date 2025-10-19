@@ -589,6 +589,19 @@ static void print_row_dynamic(Table* t, const void* src);
 // lookup helper used by prepare_select; implemented after catalog types
 int lookup_table_schema(Pager* pager, const char* name, TableSchema* out_schema);
 
+// 🔥 在这里添加新的前向声明
+/* Forward declarations for node merging functions */
+static int find_child_index_in_parent(void* parent, uint32_t child_page_num);
+static void find_siblings(Table* table, uint32_t page_num, 
+                         uint32_t* left_sibling, uint32_t* right_sibling);
+static void internal_node_remove_child(Table* table, void* parent, 
+                                       uint32_t child_page_num);
+static void leaf_node_merge_with_right(Table* table, uint32_t left_page_num, 
+                                       uint32_t right_page_num);
+static void leaf_node_merge_with_left(Table* table, uint32_t left_page_num, 
+                                      uint32_t right_page_num);
+static void handle_underflow(Table* table, uint32_t page_num);
+// 🔥 添加结束
 
 /* duplicated defines removed */
 
@@ -1206,8 +1219,24 @@ Cursor* table_start(Table* table) {
 
   void* node = get_page(table->pager, cursor->page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);
-  cursor->end_of_table = (num_cells == 0);
-
+  
+  // 🔥 新增逻辑：跳过空节点
+  while (num_cells == 0) {
+    uint32_t next_page_num = *leaf_node_next_leaf(node);
+    if (next_page_num == 0) {
+      // 所有节点都空了
+      cursor->end_of_table = true;
+      return cursor;
+    }
+    // 移动到下一个节点
+    cursor->page_num = next_page_num;
+    cursor->cell_num = 0;
+    node = get_page(table->pager, cursor->page_num);
+    num_cells = *leaf_node_num_cells(node);
+  }
+  // 🔥 新增逻辑结束
+  
+  cursor->end_of_table = false;
   return cursor;
 }
 
@@ -2299,11 +2328,121 @@ ExecuteResult execute_delete(Statement* st,Table* table){
   }
 
   fprintf(stderr, "[DEBUG-DELETE] Delete operation completed successfully\n"); fflush(stderr);
+  
+  // 🔥 新增代码开始
+  // 检查删除后节点是否需要合并
+  uint32_t current_cells = *leaf_node_num_cells(node);
+  if (current_cells == 0) {
+    fprintf(stderr, "[DEBUG-DELETE] 节点已空，触发合并\n"); fflush(stderr);
+    handle_underflow(table, cursor->page_num);
+  }
+  // 🔥 新增代码结束
+  
   free(cursor);
   return EXECUTE_SUCCESS;
 }
 
+/* 在父节点中查找子节点的索引 */
+static int find_child_index_in_parent(void* parent, uint32_t child_page_num) {
+  uint32_t num_keys = *internal_node_num_keys(parent);
+  
+  // 遍历常规子节点 (index 0 到 num_keys-1)
+  for (uint32_t i = 0; i < num_keys; i++) {
+    if (*internal_node_child(parent, i) == child_page_num) {
+      return (int)i;
+    }
+  }
+  
+  // 检查最右边的子节点
+  if (*internal_node_right_child(parent) == child_page_num) {
+    return (int)num_keys;
+  }
+  
+  return -1;  // 没找到
+}
 
+
+/* 查找节点的左右兄弟 */
+static void find_siblings(Table* table, uint32_t page_num, 
+                         uint32_t* left_sibling, uint32_t* right_sibling) {
+  *left_sibling = INVALID_PAGE_NUM;
+  *right_sibling = INVALID_PAGE_NUM;
+  
+  void* node = get_page(table->pager, page_num);
+  
+  // 根节点没有兄弟
+  if (is_node_root(node)) {
+    return;
+  }
+  
+  uint32_t parent_page_num = *node_parent(node);
+  void* parent = get_page(table->pager, parent_page_num);
+  
+  // 先找到自己在父节点的位置
+  int my_index = find_child_index_in_parent(parent, page_num);
+  if (my_index < 0) {
+    return;  // 出错了
+  }
+  
+  uint32_t num_keys = *internal_node_num_keys(parent);
+  
+  // 左兄弟：我的索引 - 1（如果存在）
+  if (my_index > 0) {
+    *left_sibling = *internal_node_child(parent, my_index - 1);
+  }
+  
+  // 右兄弟：我的索引 + 1（如果存在）
+  if (my_index < (int)num_keys) {
+    *right_sibling = *internal_node_child(parent, my_index + 1);
+  }
+}
+
+
+/* 从内部节点删除一个子节点 */
+static void internal_node_remove_child(Table* table, void* parent, 
+  uint32_t child_page_num) {
+uint32_t num_keys = *internal_node_num_keys(parent);
+int child_index = find_child_index_in_parent(parent, child_page_num);
+
+if (child_index < 0) {
+return;  // 找不到
+}
+
+fprintf(stderr, "[MERGE] 从父节点删除索引 %d 的子节点\n", child_index);
+
+// 情况1: 删除的是 right_child
+if (child_index == (int)num_keys) {
+if (num_keys > 0) {
+// 把最后一个常规子节点提升为 right_child
+*internal_node_right_child(parent) = *internal_node_child(parent, num_keys - 1);
+(*internal_node_num_keys(parent))--;
+} else {
+// 没有其他子节点了
+*internal_node_right_child(parent) = INVALID_PAGE_NUM;
+}
+return;
+}
+
+// 情况2: 删除的是常规子节点，需要左移后面的元素
+for (uint32_t i = child_index; i < num_keys - 1; i++) {
+void* dest = internal_node_cell(parent, i);
+void* src = internal_node_cell(parent, i + 1);
+memcpy(dest, src, INTERNAL_NODE_CELL_SIZE);
+}
+
+// 把 right_child 移入最后一个位置
+if (num_keys > 1) {
+uint32_t right_child = *internal_node_right_child(parent);
+*internal_node_child(parent, num_keys - 1) = right_child;
+
+// 更新 key
+void* right_node = get_page(table->pager, right_child);
+uint32_t right_max = get_node_max_key(table, right_node);
+*internal_node_key(parent, num_keys - 1) = right_max;
+}
+
+(*internal_node_num_keys(parent))--;
+}
 
 static int eval_expr_to_bool(Table* t, const void* row, Expr* e) {
   if (!e) {
@@ -2471,6 +2610,9 @@ static int eval_expr_to_bool(Table* t, const void* row, Expr* e) {
     }
     return 0;
   }
+  case EXPR_IN:
+    // TODO: implement IN expression
+    return 0;
   }
   return 0;
 }
@@ -3171,4 +3313,117 @@ int mydb_execute_json_with_ems(MYDB_Handle h, const char* sql, char** out_json) 
   }
   free(ib.buffer);
   return -5;
+}
+
+/* 将右兄弟合并到当前叶子节点 */
+static void leaf_node_merge_with_right(Table* table, uint32_t left_page_num, 
+                                       uint32_t right_page_num) {
+  fprintf(stderr, "[MERGE] 合并叶子节点 %u + %u\n", left_page_num, right_page_num);
+  
+  void* left_node = get_page(table->pager, left_page_num);
+  void* right_node = get_page(table->pager, right_page_num);
+  
+  uint32_t left_cells = *leaf_node_num_cells(left_node);
+  uint32_t right_cells = *leaf_node_num_cells(right_node);
+  
+  // 把右节点的所有 cell 复制到左节点
+  for (uint32_t i = 0; i < right_cells; i++) {
+    void* src = leaf_cell_t(table, right_node, i);
+    void* dest = leaf_cell_t(table, left_node, left_cells + i);
+    memcpy(dest, src, leaf_cell_size(table));
+  }
+  
+  // 更新左节点的 cell 数量
+  *leaf_node_num_cells(left_node) = left_cells + right_cells;
+  
+  // 更新链表：Left → Right → Next 变成 Left → Next
+  uint32_t right_next = *leaf_node_next_leaf(right_node);
+  *leaf_node_next_leaf(left_node) = right_next;
+  
+  // 清空右节点（标记为废弃）
+  *leaf_node_num_cells(right_node) = 0;
+  
+  fprintf(stderr, "[MERGE] 合并完成，左节点现在有 %u cells\n", 
+          *leaf_node_num_cells(left_node));
+}
+
+/* 将当前叶子节点合并到左兄弟 */
+static void leaf_node_merge_with_left(Table* table, uint32_t left_page_num, 
+                                      uint32_t right_page_num) {
+  // 实现和 leaf_node_merge_with_right 几乎一样
+  // 只是我们是把 right_page_num 的数据合并到 left_page_num
+  leaf_node_merge_with_right(table, left_page_num, right_page_num);
+}
+
+/* 处理节点下溢（删除后变空）的主函数 */
+static void handle_underflow(Table* table, uint32_t page_num) {
+  fprintf(stderr, "[MERGE] handle_underflow: 检查页面 %u\n", page_num);
+  
+  void* node = get_page(table->pager, page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  
+  // 步骤1: 检查是否真的需要处理
+  if (num_cells > 0) {
+    fprintf(stderr, "[MERGE] 节点还有 %u cells，不需要合并\n", num_cells);
+    return;
+  }
+  
+  // 步骤2: 根节点特殊处理
+  if (is_node_root(node)) {
+    fprintf(stderr, "[MERGE] 根节点为空，树现在是空的\n");
+    return;
+  }
+  
+  fprintf(stderr, "[MERGE] 节点为空，开始合并流程\n");
+  
+  // 步骤3: 找兄弟节点
+  uint32_t left_sibling = INVALID_PAGE_NUM;
+  uint32_t right_sibling = INVALID_PAGE_NUM;
+  find_siblings(table, page_num, &left_sibling, &right_sibling);
+  
+  uint32_t parent_page_num = *node_parent(node);
+  void* parent = get_page(table->pager, parent_page_num);
+  
+  // 步骤4: 更新链表指针
+  if (right_sibling != INVALID_PAGE_NUM) {
+    // 有右兄弟：Left → 当前(空) → Right 变成 Left → Right
+    if (left_sibling != INVALID_PAGE_NUM) {
+      void* left_node = get_page(table->pager, left_sibling);
+      *leaf_node_next_leaf(left_node) = right_sibling;
+    }
+  } else if (left_sibling != INVALID_PAGE_NUM) {
+    // 只有左兄弟：Left → 当前(空) → NULL 变成 Left → NULL
+    void* left_node = get_page(table->pager, left_sibling);
+    uint32_t my_next = *leaf_node_next_leaf(node);
+    *leaf_node_next_leaf(left_node) = my_next;
+  }
+  
+  // 步骤5: 从父节点删除当前节点的引用
+  internal_node_remove_child(table, parent, page_num);
+  
+  // 步骤6: 检查父节点是否也需要处理
+  uint32_t parent_num_keys = *internal_node_num_keys(parent);
+  fprintf(stderr, "[MERGE] 父节点现在有 %u keys\n", parent_num_keys);
+  
+  if (parent_num_keys == 0 && !is_node_root(parent)) {
+    // 父节点也空了，递归处理
+    fprintf(stderr, "[MERGE] 父节点也空了，递归处理\n");
+    handle_underflow(table, parent_page_num);
+  }
+  
+  // 步骤7: 特殊情况 - 根节点只有一个子节点
+  if (is_node_root(parent) && parent_num_keys == 0) {
+    uint32_t only_child = *internal_node_right_child(parent);
+    if (only_child != INVALID_PAGE_NUM) {
+      fprintf(stderr, "[MERGE] 根节点只有一个子节点，提升为新根\n");
+      
+      void* child_node = get_page(table->pager, only_child);
+      
+      // 把子节点的内容复制到根节点
+      memcpy(parent, child_node, MYDB_PAGE_SIZE);
+      set_node_root(parent, true);
+      
+      fprintf(stderr, "[MERGE] 树高度降低\n");
+    }
+  }
 }
